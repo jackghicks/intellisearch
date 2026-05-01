@@ -9,13 +9,15 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "browser": "./dist/web/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "intellisearch.helloWorld",
-        "title": "Hello World"
+        "command": "intellisearch.openPanel",
+        "title": "IntelliSearch: Open Panel"
       }
     ]
   },
