@@ -1,0 +1,28 @@
+{
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"name": "Run Web Extension in VS Code",
+			"type": "extensionHost",
+			"request": "launch",
+			"args": [
+				"--extensionDevelopmentPath=${workspaceFolder}",
+				"--extensionDevelopmentKind=web"
+			],
+			"outFiles": [
+				"${workspaceFolder}/dist/**/*.js"
+			],
+			"preLaunchTask": "${defaultBuildTask}"
+		},
+		{
+			"name": "Run Web Extension in Browser",
+			"type": "chrome",
+			"request": "launch",
+			"url": "http://localhost:3000",
+			"preLaunchTask": "Run Extension in Browser",
+			"presentation": {
+				"hidden": true
+			}
+		}
+	]
+}
