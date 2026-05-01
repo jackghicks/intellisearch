@@ -27,14 +27,14 @@
     "watch-web": "webpack --watch",
     "package-web": "webpack --mode production --devtool hidden-source-map",
     "lint": "eslint src",
-    "run-in-browser": "vscode-test-web --browserType=chromium --extensionDevelopmentPath=. ."
+    "run-in-browser": "vscode-test-web --browserType=chromium --extensionDevelopmentPath=."
   },
   "devDependencies": {
     "@types/vscode": "^1.100.0",
     "@types/webpack-env": "^1.18.0",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
-    "@vscode/test-web": "^0.0.65",
+    "@vscode/test-web": "^0.0.80",
     "eslint": "^9.0.0",
     "process": "^0.11.10",
     "ts-loader": "^9.5.1",
