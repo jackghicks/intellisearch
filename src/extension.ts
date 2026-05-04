@@ -453,16 +453,13 @@ async function ensureModel() {
 	try {
 		console.log('[intellisearch] importing @xenova/transformers from CDN\u2026');
 		setBadge('Importing library\u2026');
-		const { pipeline, env } = await import(
+		const { pipeline } = await import(
 			'https://cdn.jsdelivr.net/npm/@xenova/transformers@2/dist/transformers.min.js'
 		);
 		console.log('[intellisearch] import done, calling pipeline()\u2026');
-		env.allowLocalModels = false;
-		// ONNX Runtime Web defaults to multi-threaded WASM via SharedArrayBuffer.
-		// VS Code webviews are not cross-origin-isolated, so SAB is unavailable and
-		// the runtime hangs trying to create a worker pool.  Force single-threaded.
-		env.backends.onnx.wasm.numThreads = 1;
-		env.backends.onnx.wasm.simd = true;  // SIMD is fine; just no threading
+		// Do not mutate env — the POC proves the defaults work fine in the
+		// VS Code webview context.  Touching env.backends.onnx.wasm after the
+		// CDN module has initialised its WASM config causes a hang.
 		setBadge('Loading model\u2026');
 		extractor = await pipeline(
 			'feature-extraction',
