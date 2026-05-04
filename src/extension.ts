@@ -116,11 +116,14 @@ async function handleMessage(
 
 		// User clicked "Build Index" / "Rebuild Index" ----------------------------
 		case 'buildIndex':
+			console.log('[intellisearch] buildIndex message received');
 			await runBuildIndex(workspaceUri);
 			break;
 
 		// Webview finished embedding all chunks -----------------------------------
 		case 'embeddingsDone': {
+			const b64Len = (msg.vectors as string)?.length ?? 0;
+			console.log(`[intellisearch] embeddingsDone received — base64 payload ${b64Len} chars, pendingRawChunks=${pendingRawChunks.length}`);
 			if (pendingRawChunks.length === 0) {
 				panel?.webview.postMessage({
 					type: 'error',
@@ -157,7 +160,9 @@ async function handleMessage(
 			};
 
 			panel?.webview.postMessage({ type: 'savingIndex' });
+			console.log(`[intellisearch] saving index — ${chunks.length} chunks, vectors Float32Array(${vectors.length})`);
 			await saveIndex(workspaceUri, { meta, chunks, files: fileMeta }, vectors);
+			console.log('[intellisearch] index saved to disk');
 			pendingRawChunks = [];
 
 			panel?.webview.postMessage({ type: 'indexSaved', meta });
@@ -181,10 +186,13 @@ async function handleMessage(
 // Indexing orchestration
 // ---------------------------------------------------------------------------
 async function runBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
+	console.log('[intellisearch] runBuildIndex start');
 	// undefined exclude → VS Code applies files.exclude + search.exclude + .gitignore.
 	// We additionally strip .intellisearch/ so we never index our own output.
+	console.log('[intellisearch] calling findFiles…');
 	const files = await vscode.workspace.findFiles('**/*', ALWAYS_EXCLUDE);
 	const indexable = files.filter(isIndexable);
+	console.log(`[intellisearch] findFiles done — total=${files.length}, indexable=${indexable.length}`);
 
 	panel?.webview.postMessage({ type: 'chunkStart', total: indexable.length });
 
@@ -199,11 +207,13 @@ async function runBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 			file: uri.path.split('/').pop() ?? '',
 		});
 
+		console.log(`[intellisearch] chunking [${i + 1}/${indexable.length}] ${uri.path.split('/').pop()}`);
 		try {
 			const chunks = await chunkFile(uri, workspaceUri.path);
+			console.log(`[intellisearch]   → ${chunks.length} chunk(s)`);
 			rawChunks.push(...chunks);
 		} catch (err) {
-			console.warn('intellisearch: skip', uri.path, err);
+			console.warn('[intellisearch] skip', uri.path, err);
 		}
 	}
 
@@ -215,9 +225,12 @@ async function runBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 		return;
 	}
 
+	console.log(`[intellisearch] chunking complete — ${rawChunks.length} raw chunks total`);
+
 	// Persist metadata (without text) for index assembly after embedding.
 	pendingRawChunks = rawChunks.map(({ text: _t, ...meta }) => meta);
 
+	console.log('[intellisearch] posting startEmbedding to webview…');
 	// Send chunks (with text included) to the webview for embedding.
 	panel?.webview.postMessage({
 		type: 'startEmbedding',
@@ -233,8 +246,10 @@ async function runBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 }
 
 async function sendIndexToWebview(workspaceUri: vscode.Uri): Promise<void> {
+	console.log('[intellisearch] loading existing index from disk…');
 	const loaded = await loadIndex(workspaceUri);
-	if (!loaded) { return; }
+	if (!loaded) { console.warn('[intellisearch] loadIndex returned null'); return; }
+	console.log(`[intellisearch] index loaded — ${loaded.data.chunks.length} chunks, sending to webview`);
 	panel?.webview.postMessage({
 		type: 'loadIndex',
 		chunks: loaded.data.chunks,
@@ -436,23 +451,46 @@ async function ensureModel() {
 	modelLoading = true;
 	setBadge('Loading model\u2026');
 	try {
+		console.log('[intellisearch] importing @xenova/transformers from CDN\u2026');
+		setBadge('Importing library\u2026');
 		const { pipeline, env } = await import(
 			'https://cdn.jsdelivr.net/npm/@xenova/transformers@2/dist/transformers.min.js'
 		);
+		console.log('[intellisearch] import done, calling pipeline()\u2026');
 		env.allowLocalModels = false;
+		// ONNX Runtime Web defaults to multi-threaded WASM via SharedArrayBuffer.
+		// VS Code webviews are not cross-origin-isolated, so SAB is unavailable and
+		// the runtime hangs trying to create a worker pool.  Force single-threaded.
+		env.backends.onnx.wasm.numThreads = 1;
+		env.backends.onnx.wasm.simd = true;  // SIMD is fine; just no threading
+		setBadge('Loading model\u2026');
 		extractor = await pipeline(
 			'feature-extraction',
 			'jinaai/jina-embeddings-v2-base-code',
 			{
 				quantized: true,
 				progress_callback: p => {
-					if (p.status === 'download' && p.progress != null)
-						setBadge('Downloading model: ' + p.progress.toFixed(1) + '%');
+					console.log('[intellisearch] model progress:', p.status, p.file ?? '', p.progress != null ? p.progress.toFixed(1) + '%' : '');
+					if (p.status === 'initiate') {
+						setBadge('Fetching: ' + (p.file ?? 'model files') + '\u2026');
+					} else if (p.status === 'download' || p.status === 'progress') {
+						if (p.progress != null)
+							setBadge('Downloading: ' + p.progress.toFixed(1) + '%');
+					} else if (p.status === 'done') {
+						setBadge('Loading weights\u2026');
+					} else if (p.status === 'ready') {
+						setBadge('Model ready', 'ok');
+					}
 				},
 			}
 		);
+		console.log('[intellisearch] pipeline() returned, model ready');
 		setBadge('Model ready', 'ok');
 		return extractor;
+	} catch (err) {
+		console.error('[intellisearch] ensureModel failed:', err);
+		setBadge('Model load failed: ' + err.message, 'err');
+		throw err;
 	} finally {
 		modelLoading = false;
 	}
@@ -467,6 +505,7 @@ function dotProduct(a, b) {
 
 // Embedding loop
 async function handleStartEmbedding(chunks) {
+	console.log('[intellisearch] handleStartEmbedding called, chunks=' + chunks.length);
 	isIndexing = true;
 	btnBuild.disabled = true;
 	const model = await ensureModel();
