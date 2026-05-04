@@ -441,15 +441,10 @@ function base64ToFloat32(b64) {
 	return new Float32Array(buf);
 }
 
-// Model loading (lazy, idempotent)
-async function ensureModel() {
-	if (extractor) return extractor;
-	if (modelLoading) {
-		while (modelLoading) await new Promise(r => setTimeout(r, 150));
-		return extractor;
-	}
-	modelLoading = true;
-	setBadge('Loading model\u2026');
+// Model loading — start immediately on page load (top-level, like the POC)
+// so that ONNX Runtime Web initialises its WASM worker in a clean context.
+// Callers just await modelReadyPromise; it resolves to the pipeline extractor.
+const modelReadyPromise = (async () => {
 	try {
 		console.log('[intellisearch] importing @xenova/transformers from CDN\u2026');
 		setBadge('Importing library\u2026');
@@ -457,11 +452,8 @@ async function ensureModel() {
 			'https://cdn.jsdelivr.net/npm/@xenova/transformers@2/dist/transformers.min.js'
 		);
 		console.log('[intellisearch] import done, calling pipeline()\u2026');
-		// Do not mutate env — the POC proves the defaults work fine in the
-		// VS Code webview context.  Touching env.backends.onnx.wasm after the
-		// CDN module has initialised its WASM config causes a hang.
 		setBadge('Loading model\u2026');
-		extractor = await pipeline(
+		const _extractor = await pipeline(
 			'feature-extraction',
 			'jinaai/jina-embeddings-v2-base-code',
 			{
@@ -475,23 +467,21 @@ async function ensureModel() {
 							setBadge('Downloading: ' + p.progress.toFixed(1) + '%');
 					} else if (p.status === 'done') {
 						setBadge('Loading weights\u2026');
-					} else if (p.status === 'ready') {
-						setBadge('Model ready', 'ok');
 					}
 				},
 			}
 		);
-		console.log('[intellisearch] pipeline() returned, model ready');
-		setBadge('Model ready', 'ok');
-		return extractor;
+		console.log('[intellisearch] model ready');
+		extractor = _extractor;
+		// Only update the badge if we're not mid-index (don't clobber "Chunking…" etc.)
+		if (!isIndexing) setBadge('Model ready — click Build Index', 'ok');
+		return _extractor;
 	} catch (err) {
-		console.error('[intellisearch] ensureModel failed:', err);
+		console.error('[intellisearch] model load failed:', err);
 		setBadge('Model load failed: ' + err.message, 'err');
 		throw err;
-	} finally {
-		modelLoading = false;
 	}
-}
+})();
 
 // Dot product == cosine similarity when both vectors are L2-normalised.
 function dotProduct(a, b) {
@@ -505,7 +495,7 @@ async function handleStartEmbedding(chunks) {
 	console.log('[intellisearch] handleStartEmbedding called, chunks=' + chunks.length);
 	isIndexing = true;
 	btnBuild.disabled = true;
-	const model = await ensureModel();
+	const model = await modelReadyPromise;
 	const DIM   = 768;
 	const BATCH = 4;
 	const total = chunks.length;
@@ -550,7 +540,7 @@ async function runSearch() {
 	btnSearch.disabled = true;
 	setBadge('Searching\u2026');
 	try {
-		const model = await ensureModel();
+		const model = await modelReadyPromise;
 		const out   = await model(query, { pooling: 'mean', normalize: true });
 		const qvec  = out.data;
 		const DIM   = 768;
