@@ -18,6 +18,10 @@
       {
         "command": "intellisearch.openPanel",
         "title": "IntelliSearch: Open Panel"
+      },
+      {
+        "command": "intellisearch.buildIndex",
+        "title": "IntelliSearch: Build Index"
       }
     ]
   },
