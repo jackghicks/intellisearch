@@ -9,9 +9,12 @@ import { Chunk, IndexData, MetaJson } from './types';
 const MODEL_NAME = 'jinaai/jina-embeddings-v2-base-code';
 const VECTOR_DIM = 768;
 
-const EXCLUDE_GLOB =
-	'{**/.intellisearch/**,**/node_modules/**,**/.git/**,**/dist/**,**/build/**' +
-	',**/.next/**,**/__pycache__/**,**/*.min.js,**/*.min.css,**/*.map}';
+// Passing `undefined` as the exclude argument to findFiles makes VS Code merge
+// files.exclude + search.exclude settings AND honour .gitignore files
+// (controlled by the search.useIgnoreFiles setting, which is on by default).
+// We only hard-exclude .intellisearch/ ourselves — everything else is left to
+// VS Code / gitignore so that user configuration is respected.
+const ALWAYS_EXCLUDE = '**/.intellisearch/**';
 
 // ---------------------------------------------------------------------------
 // Module-level state
@@ -178,7 +181,9 @@ async function handleMessage(
 // Indexing orchestration
 // ---------------------------------------------------------------------------
 async function runBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
-	const files = await vscode.workspace.findFiles('**/*', EXCLUDE_GLOB);
+	// undefined exclude → VS Code applies files.exclude + search.exclude + .gitignore.
+	// We additionally strip .intellisearch/ so we never index our own output.
+	const files = await vscode.workspace.findFiles('**/*', ALWAYS_EXCLUDE);
 	const indexable = files.filter(isIndexable);
 
 	panel?.webview.postMessage({ type: 'chunkStart', total: indexable.length });
