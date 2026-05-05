@@ -30,6 +30,16 @@ let pendingRawChunks: Array<Omit<RawChunk, 'text'>> = [];
 /** Deferred flag: true when `intellisearch.buildIndex` was called before the webview initialised. */
 let pendingAutoBuild = false;
 
+/** True once the webview's embedding model has finished loading. */
+let isWebviewEmbedReady = false;
+
+/** Pending embed-query requests from the LM tool, keyed by request ID. */
+const pendingEmbedRequests = new Map<string, {
+	query: string;
+	resolve: (v: Float32Array) => void;
+	reject: (e: Error) => void;
+}>();
+
 // ---------------------------------------------------------------------------
 // Activation
 // ---------------------------------------------------------------------------
@@ -42,6 +52,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			pendingAutoBuild = true;
 			openPanel(context);
 		}),
+		vscode.lm.registerTool('intellisearch_search', new IntelliSearchTool(context)),
 	);
 
 	openPanel(context);
@@ -78,7 +89,15 @@ async function openPanel(context: vscode.ExtensionContext): Promise<void> {
 	);
 
 	panel.onDidDispose(
-		() => { panel = undefined; pendingRawChunks = []; },
+		() => {
+			panel = undefined;
+			pendingRawChunks = [];
+			isWebviewEmbedReady = false;
+			for (const req of pendingEmbedRequests.values()) {
+				req.reject(new Error('IntelliSearch panel was closed before the query could be embedded.'));
+			}
+			pendingEmbedRequests.clear();
+		},
 		null,
 		context.subscriptions,
 	);
@@ -179,6 +198,34 @@ async function handleMessage(
 			await vscode.commands.executeCommand('vscode.open', fileUri, opts);
 			break;
 		}
+
+		// Webview model finished loading — flush any queued embed requests --------
+		case 'modelReady':
+			isWebviewEmbedReady = true;
+			for (const [requestId, req] of pendingEmbedRequests) {
+				panel?.webview.postMessage({ type: 'embedQuery', requestId, query: req.query });
+			}
+			break;
+
+		// Webview returned an embedding for a tool search query -------------------
+		case 'queryEmbedding': {
+			const req = pendingEmbedRequests.get(msg.requestId as string);
+			if (req) {
+				pendingEmbedRequests.delete(msg.requestId as string);
+				req.resolve(base64ToFloat32(msg.vector as string));
+			}
+			break;
+		}
+
+		// Webview failed to embed a query -----------------------------------------
+		case 'embedQueryError': {
+			const req = pendingEmbedRequests.get(msg.requestId as string);
+			if (req) {
+				pendingEmbedRequests.delete(msg.requestId as string);
+				req.reject(new Error(msg.message as string));
+			}
+			break;
+		}
 	}
 }
 
@@ -256,6 +303,118 @@ async function sendIndexToWebview(workspaceUri: vscode.Uri): Promise<void> {
 		vectors: float32ToBase64(loaded.vectors),
 		meta: loaded.data.meta,
 	});
+}
+
+// ---------------------------------------------------------------------------
+// LM Tool — semantic search exposed to Copilot agents
+// ---------------------------------------------------------------------------
+
+interface SearchInput {
+	query: string;
+	maxResults?: number;
+}
+
+function dotProductF32(a: Float32Array, b: Float32Array): number {
+	let s = 0;
+	for (let i = 0; i < a.length; i++) { s += a[i] * b[i]; }
+	return s;
+}
+
+function embedQueryViaWebview(query: string): Promise<Float32Array> {
+	return new Promise<Float32Array>((resolve, reject) => {
+		const requestId = Math.random().toString(36).slice(2);
+		const timer = setTimeout(() => {
+			pendingEmbedRequests.delete(requestId);
+			reject(new Error('Embedding timed out after 60 s. The model may still be downloading — try again shortly.'));
+		}, 60_000);
+
+		pendingEmbedRequests.set(requestId, {
+			query,
+			resolve: (v) => { clearTimeout(timer); resolve(v); },
+			reject:  (e) => { clearTimeout(timer); reject(e); },
+		});
+
+		if (isWebviewEmbedReady) {
+			panel?.webview.postMessage({ type: 'embedQuery', requestId, query });
+		}
+		// else: flushed automatically when modelReady fires
+	});
+}
+
+class IntelliSearchTool implements vscode.LanguageModelTool<SearchInput> {
+	constructor(private readonly ctx: vscode.ExtensionContext) {}
+
+	async invoke(
+		options: vscode.LanguageModelToolInvocationOptions<SearchInput>,
+		_token: vscode.CancellationToken,
+	): Promise<vscode.LanguageModelToolResult> {
+		const { query, maxResults = 8 } = options.input;
+
+		const workspaceUri = vscode.workspace.workspaceFolders?.[0]?.uri;
+		if (!workspaceUri) {
+			return new vscode.LanguageModelToolResult([
+				new vscode.LanguageModelTextPart('No workspace folder is open.'),
+			]);
+		}
+
+		if (!(await indexExists(workspaceUri))) {
+			return new vscode.LanguageModelToolResult([
+				new vscode.LanguageModelTextPart(
+					'No IntelliSearch index found. Ask the user to run the "IntelliSearch: Build Index" command first.',
+				),
+			]);
+		}
+
+		// Ensure the panel is open so the embedding model is available.
+		openPanel(this.ctx);
+
+		let queryVector: Float32Array;
+		try {
+			queryVector = await embedQueryViaWebview(query);
+		} catch (err) {
+			return new vscode.LanguageModelToolResult([
+				new vscode.LanguageModelTextPart(`Failed to embed query: ${(err as Error).message}`),
+			]);
+		}
+
+		const loaded = await loadIndex(workspaceUri);
+		if (!loaded) {
+			return new vscode.LanguageModelToolResult([
+				new vscode.LanguageModelTextPart('Failed to load the search index from disk.'),
+			]);
+		}
+
+		const { data, vectors } = loaded;
+		const scored = data.chunks.map(chunk => ({
+			chunk,
+			score: dotProductF32(
+				queryVector,
+				vectors.subarray(chunk.vectorOffset, chunk.vectorOffset + VECTOR_DIM),
+			),
+		}));
+		scored.sort((a, b) => b.score - a.score);
+		const top = scored.slice(0, maxResults);
+
+		if (top.length === 0) {
+			return new vscode.LanguageModelToolResult([
+				new vscode.LanguageModelTextPart('No results found.'),
+			]);
+		}
+
+		const lines = [`IntelliSearch results for: "${query}"`, ''];
+		for (const [i, { chunk, score }] of top.entries()) {
+			const loc = `L${chunk.range.start + 1}-${chunk.range.end + 1}`;
+			const sym = chunk.symbolName ? ` [${chunk.symbolName}]` : '';
+			const pct = (score * 100).toFixed(1);
+			lines.push(`${i + 1}. ${chunk.file}${sym}  ${loc}  (${pct}% match)`);
+			lines.push(chunk.preview);
+			lines.push('');
+		}
+
+		return new vscode.LanguageModelToolResult([
+			new vscode.LanguageModelTextPart(lines.join('\n')),
+		]);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +661,7 @@ const modelReadyPromise = (async () => {
 		);
 		console.log('[intellisearch] model ready');
 		extractor = _extractor;
+		vscode.postMessage({ type: 'modelReady' });
 		// Only update the badge if we're not mid-index (don't clobber "Chunking…" etc.)
 		if (!isIndexing) setBadge('Model ready — click Build Index', 'ok');
 		return _extractor;
@@ -696,6 +856,18 @@ window.addEventListener('message', async e => {
 			isIndexing = false;
 			btnBuild.disabled = false;
 			break;
+
+		case 'embedQuery': {
+			const { requestId, query } = msg;
+			try {
+				const model = await modelReadyPromise;
+				const out = await model(query, { pooling: 'mean', normalize: true });
+				vscode.postMessage({ type: 'queryEmbedding', requestId, vector: float32ToBase64(new Float32Array(out.data)) });
+			} catch (err) {
+				vscode.postMessage({ type: 'embedQueryError', requestId, message: err.message });
+			}
+			break;
+		}
 	}
 });
 

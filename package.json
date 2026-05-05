@@ -23,6 +23,28 @@
         "command": "intellisearch.buildIndex",
         "title": "IntelliSearch: Build Index"
       }
+    ],
+    "languageModelTools": [
+      {
+        "name": "intellisearch_search",
+        "tags": ["search", "codebase", "semantic"],
+        "displayName": "IntelliSearch: Semantic Search",
+        "modelDescription": "Searches the workspace codebase using semantic vector similarity (cosine distance). Use this instead of grep or reading files when you need to find code related to a concept, feature, or behaviour. Returns ranked chunks with file paths and line ranges so you can read only the most relevant sections. Requires the IntelliSearch index to have been built first.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Natural language or code description of what to find, e.g. 'cosine similarity calculation' or 'error handling for file not found'"
+            },
+            "maxResults": {
+              "type": "number",
+              "description": "Maximum number of results to return (default: 8)"
+            }
+          },
+          "required": ["query"]
+        }
+      }
     ]
   },
   "scripts": {
