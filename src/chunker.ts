@@ -1,14 +1,23 @@
 import * as vscode from 'vscode';
 
 // ---- Sizing constants -----------------------------------------------------------
-//   jina-embeddings-v2-base-code: 8 192-token context window.
-//   Target ~350 tokens ≈ 1 400 chars; hard ceiling 1 500 tokens ≈ 6 000 chars.
-const MIN_CHARS = 80;
-const MAX_CHARS = 6_000;
+//   jina-embeddings-v2-base-code sweet spot for retrieval is 128–256 tokens.
+//   Single-threaded WASM inference time is roughly O(n²) in token count:
+//     ~128 tokens (~512 chars)   ≈ 0.3–0.5 s
+//     ~256 tokens (~1 024 chars) ≈ 0.8–1.2 s
+//     ~512 tokens (~2 048 chars) ≈ 3–5 s      ← avoid
+//
+//   Hard cap: 1 024 chars ≈ 256 tokens.
+//   Soft threshold: recurse into symbol children when symbol exceeds 800 chars.
+//   Minimum meaningful chunk: 40 chars.
+const MIN_CHARS = 40;
+const SOFT_MAX_CHARS = 800;   // prefer to recurse into children above this
+const MAX_CHARS = 1_024;       // hard ceiling — truncate anything beyond
 
-// Line-based fallback: 40 lines per chunk with a 5-line overlap.
-const LINES_PER_CHUNK = 40;
-const OVERLAP_LINES = 5;
+// Line-based fallback: 15 lines per chunk with a 3-line overlap keeps chunks
+// well within the 256-token target for typical code line lengths.
+const LINES_PER_CHUNK = 15;
+const OVERLAP_LINES = 3;
 
 // ---- File-type filter -----------------------------------------------------------
 const INDEXABLE_EXT = new Set([
@@ -84,9 +93,15 @@ function chunksFromSymbols(
 			const startLine = sym.range.start.line;
 			const endLine = sym.range.end.line;
 
-			if (text.length > MAX_CHARS && sym.children.length > 0 && depth < 3) {
-				// Container too large — recurse into its children instead.
+			if (text.length > SOFT_MAX_CHARS && sym.children.length > 0 && depth < 4) {
+				// Symbol is larger than our soft target — recurse into children first.
 				visit(sym.children, depth + 1);
+				// Also emit a truncated version of the parent so its signature /
+				// docstring is represented in the index even for large containers.
+				const header = text.slice(0, MAX_CHARS);
+				if (header.length >= MIN_CHARS) {
+					chunks.push(makeChunk(header, startLine, endLine, relPath, sym.name));
+				}
 			} else if (text.length >= MIN_CHARS) {
 				const trimmed = text.length > MAX_CHARS ? text.slice(0, MAX_CHARS) : text;
 				chunks.push(makeChunk(trimmed, startLine, endLine, relPath, sym.name));
