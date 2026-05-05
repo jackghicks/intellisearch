@@ -329,6 +329,10 @@ button:not(:disabled):hover{background:var(--vscode-button-hoverBackground,#1177
 .pbar{background:var(--vscode-editorWidget-border,#454545);height:3px;border-radius:2px;overflow:hidden}
 #pbar-fill{background:var(--vscode-progressBar-background,#0e70c0);height:100%;width:0%;transition:width .25s ease}
 #progress-detail{font-size:.8em;color:var(--vscode-descriptionForeground,#666);font-family:var(--vscode-editor-font-family,monospace)}
+#embed-section{display:none;flex-direction:column;gap:4px}
+#embed-label{font-size:.85em;color:var(--vscode-descriptionForeground,#888)}
+#embed-fill{background:var(--vscode-charts-yellow,#cca700);height:100%;width:0%;transition:width .1s ease}
+#embed-detail{font-size:.8em;color:var(--vscode-descriptionForeground,#666);font-family:var(--vscode-editor-font-family,monospace)}
 #search-section{display:none;flex-direction:column;gap:8px}
 .search-row{display:flex;gap:6px}
 #search-input{
@@ -377,7 +381,11 @@ button:not(:disabled):hover{background:var(--vscode-button-hoverBackground,#1177
 	<div class="pbar"><div id="pbar-fill"></div></div>
 	<div id="progress-detail"></div>
 </div>
-
+<div id="embed-section">
+	<div id="embed-label">Generating embeddings…</div>
+	<div class="pbar"><div id="embed-fill"></div></div>
+	<div id="embed-detail"></div>
+</div>
 <div id="search-section">
 	<div class="search-row">
 		<input id="search-input" type="text" placeholder="Describe what you\u2019re looking for\u2026"
@@ -422,6 +430,27 @@ function showProgress(label, pct, detail) {
 }
 function hideProgress() { progressSec.style.display = 'none'; }
 function showSearch()   { searchSec.style.display = 'flex'; }
+
+// Yield until the browser has committed a paint frame.
+// requestAnimationFrame fires just before the next render, so awaiting it
+// guarantees the pending DOM mutations are visible before we continue.
+const paint = () => new Promise(r => requestAnimationFrame(r));
+
+const embedSec    = document.getElementById('embed-section');
+const embedLabel  = document.getElementById('embed-label');
+const embedFill   = document.getElementById('embed-fill');
+const embedDetail = document.getElementById('embed-detail');
+
+function showEmbedProgress(done, total, currentFile) {
+	embedSec.style.display = 'flex';
+	const pct = total > 0 ? (done / total) * 100 : 0;
+	embedFill.style.width = Math.max(0, Math.min(100, pct)) + '%';
+	const eta = done > 0 ? Math.round(((Date.now() - embedStartTime) / done) * (total - done) / 1000) : null;
+	const etaStr = eta !== null && eta > 0 ? '  —  ~' + (eta >= 60 ? Math.floor(eta/60) + 'm ' + (eta%60) + 's' : eta + 's') + ' left' : '';
+	embedDetail.textContent = done + ' / ' + total + ' chunks' + (currentFile ? '  —  ' + currentFile : '') + etaStr;
+}
+function hideEmbedProgress() { embedSec.style.display = 'none'; }
+let embedStartTime = 0;
 
 // Float32 <-> Base64
 function float32ToBase64(arr) {
@@ -497,25 +526,26 @@ async function handleStartEmbedding(chunks) {
 	btnBuild.disabled = true;
 	const model = await modelReadyPromise;
 	const DIM   = 768;
-	const BATCH = 4;
 	const total = chunks.length;
 	const allVec = new Float32Array(total * DIM);
 
-	for (let i = 0; i < total; i += BATCH) {
-		const batch = chunks.slice(i, i + BATCH);
+	hideProgress(); // chunking bar no longer relevant
+	embedStartTime = Date.now();
+	embedLabel.textContent = 'Generating embeddings (' + total + ' chunks)\u2026';
+	showEmbedProgress(0, total, null);
+	await paint(); // let the browser paint the embed bar before WASM takes the thread
+
+	for (let i = 0; i < total; i++) {
+		const chunk = chunks[i];
 		try {
-			const out = await model(batch.map(c => c.text), { pooling: 'mean', normalize: true });
+			const out = await model(chunk.text, { pooling: 'mean', normalize: true });
 			allVec.set(out.data, i * DIM);
-		} catch {
-			for (let j = 0; j < batch.length; j++) {
-				try {
-					const out = await model(batch[j].text, { pooling: 'mean', normalize: true });
-					allVec.set(out.data, (i + j) * DIM);
-				} catch { /* leave as zero vector */ }
-			}
+		} catch (err) {
+			console.warn('[intellisearch] embedding failed for chunk', i, chunk.file, err);
+			// leave as zero vector
 		}
-		const done = Math.min(i + BATCH, total);
-		showProgress('Embedding chunks\u2026', (done / total) * 100, done + ' / ' + total);
+		showEmbedProgress(i + 1, total, chunk.file ?? null);
+		await paint();
 	}
 
 	// Cache index in-memory so search works immediately without reloading.
@@ -643,12 +673,14 @@ window.addEventListener('message', async e => {
 			break;
 
 		case 'savingIndex':
+			hideEmbedProgress();
 			showProgress('Saving index\u2026', 100);
 			setBadge('Saving\u2026');
 			break;
 
 		case 'indexSaved':
 			hideProgress();
+			hideEmbedProgress();
 			setBadge(msg.meta.chunkCount + ' chunks indexed', 'ok');
 			isIndexing = false;
 			btnBuild.disabled = false;
@@ -659,6 +691,7 @@ window.addEventListener('message', async e => {
 
 		case 'error':
 			hideProgress();
+			hideEmbedProgress();
 			setBadge('Error: ' + msg.message, 'err');
 			isIndexing = false;
 			btnBuild.disabled = false;
