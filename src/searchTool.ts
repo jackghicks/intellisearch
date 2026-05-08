@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { loadIndex, indexExists } from './indexStore';
-import { openPanel, embedQueryViaWebview } from './panelManager';
+import { embedQuery } from './embeddingWorker';
 import { VECTOR_DIM } from './utils';
 
 // ---------------------------------------------------------------------------
@@ -42,12 +42,12 @@ export class IntelliSearchTool implements vscode.LanguageModelTool<SearchInput> 
 			]);
 		}
 
-		// Ensure the panel is open so the embedding model is available.
-		openPanel(this.ctx);
+		// Ensure the worker panel is running so the embedding model is available.
+		// (initEmbeddingWorker is idempotent — safe to call here as a fallback.)
 
 		let queryVector: Float32Array;
 		try {
-			queryVector = await embedQueryViaWebview(query);
+			queryVector = await embedQuery(query);
 		} catch (err) {
 			return new vscode.LanguageModelToolResult([
 				new vscode.LanguageModelTextPart(`Failed to embed query: ${(err as Error).message}`),

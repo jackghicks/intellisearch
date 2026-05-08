@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy"
+	content="default-src 'none';
+		script-src 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' https://cdn.jsdelivr.net blob:;
+		connect-src https: blob: data:;
+		worker-src blob:;
+		style-src 'unsafe-inline';">
+<title>IntelliSearch Worker</title>
+</head>
+<body style="font-family:var(--vscode-font-family,sans-serif);font-size:var(--vscode-font-size,13px);background:var(--vscode-editor-background,#1e1e1e);color:var(--vscode-editor-foreground,#d4d4d4);padding:20px;display:flex;flex-direction:column;gap:12px">
+
+<div style="display:flex;align-items:center;gap:10px">
+	<span style="font-size:1.2em">&#x2699;&#xFE0F;</span>
+	<strong>IntelliSearch Embedding Worker</strong>
+	<span id="status" style="font-size:.8em;padding:2px 8px;border-radius:10px;background:var(--vscode-badge-background,#4d4d4d);color:var(--vscode-badge-foreground,#fff)">Loading model&#x2026;</span>
+</div>
+
+<p style="color:var(--vscode-descriptionForeground,#888);font-size:.9em;line-height:1.5em;max-width:480px">
+	This tab runs the ONNX embedding model (jina-embeddings-v2-base-code) used by
+	IntelliSearch to build the index and power semantic search.
+	<strong style="color:var(--vscode-editor-foreground,#d4d4d4)">Please do not close it</strong> — if you do,
+	it will be recreated automatically the next time a search or index build is triggered.
+</p>
+<script type="module">
+const vscode = acquireVsCodeApi();
+const statusEl = document.getElementById('status');
+
+function setStatus(text, ok) {
+	statusEl.textContent = text;
+	statusEl.style.background = ok
+		? 'var(--vscode-testing-iconPassed,#4ec9b0)'
+		: ok === false
+			? 'var(--vscode-inputValidation-errorBackground,#5a1d1d)'
+			: 'var(--vscode-badge-background,#4d4d4d)';
+	statusEl.style.color = ok === true ? '#000' : 'var(--vscode-badge-foreground,#fff)';
+}
+
+// ---------------------------------------------------------------------------
+// Float32 <-> Base64
+// ---------------------------------------------------------------------------
+function float32ToBase64(arr) {
+	const bytes = new Uint8Array(arr.buffer);
+	const CHUNK = 0x8000;
+	let bin = '';
+	for (let i = 0; i < bytes.length; i += CHUNK)
+		bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+	return btoa(bin);
+}
+
+// ---------------------------------------------------------------------------
+// Model initialisation — begin immediately on page load so ONNX Runtime
+// WASM worker starts in a clean context well before any embed request.
+// ---------------------------------------------------------------------------
+const modelReadyPromise = (async () => {
+	try {
+		const { pipeline } = await import(
+			'https://cdn.jsdelivr.net/npm/@xenova/transformers@2/dist/transformers.min.js'
+		);
+		const extractor = await pipeline(
+			'feature-extraction',
+			'jinaai/jina-embeddings-v2-base-code',
+			{ quantized: true },
+		);
+		vscode.postMessage({ type: 'modelReady' });
+		setStatus('Model ready', true);
+		return extractor;
+	} catch (err) {
+		vscode.postMessage({ type: 'modelError', message: err.message });
+		setStatus('Model load failed: ' + err.message, false);
+		throw err;
+	}
+})();
+
+// ---------------------------------------------------------------------------
+// Message handler (extension -> worker)
+// ---------------------------------------------------------------------------
+window.addEventListener('message', async e => {
+	const msg = e.data;
+	switch (msg.type) {
+
+		// Batch-embed all chunks for an index build ----------------------------
+		case 'startEmbedding': {
+			const model  = await modelReadyPromise;
+			const chunks = msg.chunks;           // Array<{ text, file }>
+			const DIM    = 768;
+			const allVec = new Float32Array(chunks.length * DIM);
+
+			for (let i = 0; i < chunks.length; i++) {
+				try {
+					const out = await model(chunks[i].text, { pooling: 'mean', normalize: true });
+					allVec.set(out.data, i * DIM);
+				} catch {
+					// leave as zero vector
+				}
+				vscode.postMessage({
+					type: 'embedProgress',
+					done:  i + 1,
+					total: chunks.length,
+					file:  chunks[i].file ?? '',
+				});
+			}
+
+			vscode.postMessage({ type: 'embeddingsDone', vectors: float32ToBase64(allVec) });
+			break;
+		}
+
+		// Single-query embed for search ----------------------------------------
+		case 'embedQuery': {
+			const { requestId, query } = msg;
+			try {
+				const model = await modelReadyPromise;
+				const out   = await model(query, { pooling: 'mean', normalize: true });
+				vscode.postMessage({
+					type:      'queryEmbedding',
+					requestId,
+					vector: float32ToBase64(new Float32Array(out.data)),
+				});
+			} catch (err) {
+				vscode.postMessage({ type: 'embedQueryError', requestId, message: err.message });
+			}
+			break;
+		}
+	}
+});
+</script>
+</body>
+</html>

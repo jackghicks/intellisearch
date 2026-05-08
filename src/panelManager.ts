@@ -2,7 +2,8 @@ import * as vscode from 'vscode';
 import { chunkFile, isIndexable, RawChunk } from './chunker';
 import { saveIndex, loadIndex, indexExists } from './indexStore';
 import { Chunk, IndexData, MetaJson } from './types';
-import { MODEL_NAME, VECTOR_DIM, ALWAYS_EXCLUDE, float32ToBase64, base64ToFloat32 } from './utils';
+import { MODEL_NAME, VECTOR_DIM, ALWAYS_EXCLUDE } from './utils';
+import { embedBatch, embedQuery } from './embeddingWorker';
 import panelHtml from './webview/panel.html';
 
 // ---------------------------------------------------------------------------
@@ -10,24 +11,11 @@ import panelHtml from './webview/panel.html';
 // ---------------------------------------------------------------------------
 let panel: vscode.WebviewPanel | undefined;
 
-/**
- * Raw chunk metadata kept in memory while the webview computes embeddings.
- * Cleared once the index is saved.
- */
-let pendingRawChunks: Array<Omit<RawChunk, 'text'>> = [];
-
 /** Deferred flag: true when `intellisearch.buildIndex` was called before the webview initialised. */
 let pendingAutoBuild = false;
 
-/** True once the webview's embedding model has finished loading. */
-let isWebviewEmbedReady = false;
-
-/** Pending embed-query requests from the LM tool, keyed by request ID. */
-const pendingEmbedRequests = new Map<string, {
-	query: string;
-	resolve: (v: Float32Array) => void;
-	reject: (e: Error) => void;
-}>();
+/** Index held in extension-host memory for fast search. */
+let inMemoryIndex: { data: IndexData; vectors: Float32Array } | null = null;
 
 // ---------------------------------------------------------------------------
 // Panel management
@@ -60,12 +48,6 @@ export async function openPanel(context: vscode.ExtensionContext): Promise<void>
 	panel.onDidDispose(
 		() => {
 			panel = undefined;
-			pendingRawChunks = [];
-			isWebviewEmbedReady = false;
-			for (const req of pendingEmbedRequests.values()) {
-				req.reject(new Error('IntelliSearch panel was closed before the query could be embedded.'));
-			}
-			pendingEmbedRequests.clear();
 		},
 		null,
 		context.subscriptions,
@@ -112,55 +94,6 @@ async function handleMessage(
 			await runBuildIndex(workspaceUri);
 			break;
 
-		// Webview finished embedding all chunks -----------------------------------
-		case 'embeddingsDone': {
-			const b64Len = (msg.vectors as string)?.length ?? 0;
-			console.log(`[intellisearch] embeddingsDone received — base64 payload ${b64Len} chars, pendingRawChunks=${pendingRawChunks.length}`);
-			if (pendingRawChunks.length === 0) {
-				panel?.webview.postMessage({
-					type: 'error',
-					message: 'Received embeddings but chunk metadata was lost. Please rebuild.',
-				});
-				return;
-			}
-
-			const vectors = base64ToFloat32(msg.vectors as string);
-
-			const chunks: Chunk[] = pendingRawChunks.map((rc, i) => ({
-				id: i,
-				file: rc.file,
-				range: rc.range,
-				tokenCount: rc.tokenCount,
-				preview: rc.preview,
-				symbolName: rc.symbolName,
-				vectorOffset: i * VECTOR_DIM,
-			}));
-
-			const fileMeta: IndexData['files'] = {};
-			for (const rc of pendingRawChunks) {
-				const fm = fileMeta[rc.file] ?? { mtime: 0, chunkCount: 0 };
-				fm.chunkCount += 1;
-				fileMeta[rc.file] = fm;
-			}
-
-			const meta: MetaJson = {
-				version: 1,
-				model: MODEL_NAME,
-				created: Date.now(),
-				chunkCount: chunks.length,
-				vectorDim: VECTOR_DIM,
-			};
-
-			panel?.webview.postMessage({ type: 'savingIndex' });
-			console.log(`[intellisearch] saving index — ${chunks.length} chunks, vectors Float32Array(${vectors.length})`);
-			await saveIndex(workspaceUri, { meta, chunks, files: fileMeta }, vectors);
-			console.log('[intellisearch] index saved to disk');
-			pendingRawChunks = [];
-
-			panel?.webview.postMessage({ type: 'indexSaved', meta });
-			break;
-		}
-
 		// Open a file at a given line range in the editor -------------------------
 		case 'openFile': {
 			const fileUri = vscode.Uri.joinPath(workspaceUri, msg.file as string);
@@ -172,31 +105,25 @@ async function handleMessage(
 			break;
 		}
 
-		// Webview model finished loading — flush any queued embed requests --------
-		case 'modelReady':
-			isWebviewEmbedReady = true;
-			for (const [requestId, req] of pendingEmbedRequests) {
-				panel?.webview.postMessage({ type: 'embedQuery', requestId, query: req.query });
+		// UI panel search query — embed via worker, search in extension host ------
+		case 'searchQuery': {
+			const query = msg.query as string;
+			if (!inMemoryIndex) {
+				panel?.webview.postMessage({ type: 'searchError', message: 'No index loaded.' });
+				return;
 			}
-			break;
-
-		// Webview returned an embedding for a tool search query -------------------
-		case 'queryEmbedding': {
-			const req = pendingEmbedRequests.get(msg.requestId as string);
-			if (req) {
-				pendingEmbedRequests.delete(msg.requestId as string);
-				req.resolve(base64ToFloat32(msg.vector as string));
+			let queryVector: Float32Array;
+			try {
+				queryVector = await embedQuery(query);
+			} catch (err) {
+				panel?.webview.postMessage({
+					type: 'searchError',
+					message: (err as Error).message,
+				});
+				return;
 			}
-			break;
-		}
-
-		// Webview failed to embed a query -----------------------------------------
-		case 'embedQueryError': {
-			const req = pendingEmbedRequests.get(msg.requestId as string);
-			if (req) {
-				pendingEmbedRequests.delete(msg.requestId as string);
-				req.reject(new Error(msg.message as string));
-			}
+			const results = cosineSearch(inMemoryIndex, queryVector, 10);
+			panel?.webview.postMessage({ type: 'searchResults', results });
 			break;
 		}
 	}
@@ -207,7 +134,6 @@ async function handleMessage(
 // ---------------------------------------------------------------------------
 async function runBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 	console.log('[intellisearch] runBuildIndex start');
-	console.log('[intellisearch] calling findFiles…');
 	const files = await vscode.workspace.findFiles('**/*', ALWAYS_EXCLUDE);
 	const indexable = files.filter(isIndexable);
 	console.log(`[intellisearch] findFiles done — total=${files.length}, indexable=${indexable.length}`);
@@ -224,11 +150,9 @@ async function runBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 			total: indexable.length,
 			file: uri.path.split('/').pop() ?? '',
 		});
-
-		console.log(`[intellisearch] chunking [${i + 1}/${indexable.length}] ${uri.path.split('/').pop()}`);
 		try {
 			const chunks = await chunkFile(uri, workspaceUri.path);
-			console.log(`[intellisearch]   → ${chunks.length} chunk(s)`);
+			console.log(`[intellisearch]   → ${chunks.length} chunk(s) from ${uri.path.split('/').pop()}`);
 			rawChunks.push(...chunks);
 		} catch (err) {
 			console.warn('[intellisearch] skip', uri.path, err);
@@ -245,55 +169,93 @@ async function runBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 
 	console.log(`[intellisearch] chunking complete — ${rawChunks.length} raw chunks total`);
 
-	pendingRawChunks = rawChunks.map(({ text: _t, ...meta }) => meta);
+	// Embed via the background worker (WASM lives there, not in the UI panel).
+	let vectors: Float32Array;
+	try {
+		vectors = await embedBatch(
+			rawChunks.map(rc => ({ text: rc.text, file: rc.file })),
+			(done, total, file) => {
+				panel?.webview.postMessage({ type: 'embedProgress', done, total, file });
+			},
+		);
+	} catch (err) {
+		console.error('[intellisearch] embedBatch failed:', err);
+		panel?.webview.postMessage({
+			type: 'error',
+			message: `Embedding failed: ${(err as Error).message}`,
+		});
+		return;
+	}
 
-	console.log('[intellisearch] posting startEmbedding to webview…');
-	panel?.webview.postMessage({
-		type: 'startEmbedding',
-		chunks: rawChunks.map((rc, i) => ({
-			id: i,
-			text: rc.text,
-			file: rc.file,
-			range: rc.range,
-			preview: rc.preview,
-			symbolName: rc.symbolName,
-		})),
-	});
+	const chunks: Chunk[] = rawChunks.map((rc, i) => ({
+		id: i,
+		file: rc.file,
+		range: rc.range,
+		tokenCount: rc.tokenCount,
+		preview: rc.preview,
+		symbolName: rc.symbolName,
+		vectorOffset: i * VECTOR_DIM,
+	}));
+
+	const fileMeta: IndexData['files'] = {};
+	for (const rc of rawChunks) {
+		const fm = fileMeta[rc.file] ?? { mtime: 0, chunkCount: 0 };
+		fm.chunkCount += 1;
+		fileMeta[rc.file] = fm;
+	}
+
+	const meta: MetaJson = {
+		version: 1,
+		model: MODEL_NAME,
+		created: Date.now(),
+		chunkCount: chunks.length,
+		vectorDim: VECTOR_DIM,
+	};
+
+	const indexData: IndexData = { meta, chunks, files: fileMeta };
+
+	panel?.webview.postMessage({ type: 'savingIndex' });
+	console.log(`[intellisearch] saving index — ${chunks.length} chunks`);
+	await saveIndex(workspaceUri, indexData, vectors);
+	inMemoryIndex = { data: indexData, vectors };
+	console.log('[intellisearch] index saved to disk');
+
+	panel?.webview.postMessage({ type: 'indexSaved', meta });
 }
 
 async function sendIndexToWebview(workspaceUri: vscode.Uri): Promise<void> {
 	console.log('[intellisearch] loading existing index from disk…');
 	const loaded = await loadIndex(workspaceUri);
 	if (!loaded) { console.warn('[intellisearch] loadIndex returned null'); return; }
-	console.log(`[intellisearch] index loaded — ${loaded.data.chunks.length} chunks, sending to webview`);
+	inMemoryIndex = loaded;
+	console.log(`[intellisearch] index loaded — ${loaded.data.chunks.length} chunks`);
 	panel?.webview.postMessage({
-		type: 'loadIndex',
-		chunks: loaded.data.chunks,
-		vectors: float32ToBase64(loaded.vectors),
-		meta: loaded.data.meta,
+		type:       'loadIndex',
+		chunkCount: loaded.data.chunks.length,
+		meta:       loaded.data.meta,
 	});
 }
 
 // ---------------------------------------------------------------------------
-// Embed-query bridge — used by the LM tool to route queries through the webview
+// Search helpers
 // ---------------------------------------------------------------------------
-export function embedQueryViaWebview(query: string): Promise<Float32Array> {
-	return new Promise<Float32Array>((resolve, reject) => {
-		const requestId = Math.random().toString(36).slice(2);
-		const timer = setTimeout(() => {
-			pendingEmbedRequests.delete(requestId);
-			reject(new Error('Embedding timed out after 60 s. The model may still be downloading — try again shortly.'));
-		}, 60_000);
-
-		pendingEmbedRequests.set(requestId, {
-			query,
-			resolve: (v) => { clearTimeout(timer); resolve(v); },
-			reject:  (e) => { clearTimeout(timer); reject(e); },
-		});
-
-		if (isWebviewEmbedReady) {
-			panel?.webview.postMessage({ type: 'embedQuery', requestId, query });
-		}
-		// else: flushed automatically when modelReady fires
+function cosineSearch(
+	index: { data: IndexData; vectors: Float32Array },
+	queryVec: Float32Array,
+	topK: number,
+): Array<{ chunk: Chunk; score: number }> {
+	const { data: { chunks }, vectors } = index;
+	const scored = chunks.map(chunk => {
+		const vec = vectors.subarray(chunk.vectorOffset, chunk.vectorOffset + VECTOR_DIM);
+		let s = 0;
+		for (let i = 0; i < vec.length; i++) { s += queryVec[i] * vec[i]; }
+		return { chunk, score: s };
 	});
+	scored.sort((a, b) => b.score - a.score);
+	return scored.slice(0, topK);
 }
+
+// ---------------------------------------------------------------------------
+// Embed-query bridge — used by the LM tool (searchTool.ts)
+// ---------------------------------------------------------------------------
+export { embedQuery as embedQueryViaWebview };
