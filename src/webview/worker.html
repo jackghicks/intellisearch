@@ -9,34 +9,127 @@
 		worker-src blob:;
 		style-src 'unsafe-inline';">
 <title>IntelliSearch Worker</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+	font-family:var(--vscode-font-family,sans-serif);
+	font-size:var(--vscode-font-size,13px);
+	background:var(--vscode-editor-background,#1e1e1e);
+	color:var(--vscode-editor-foreground,#d4d4d4);
+	padding:18px;display:flex;flex-direction:column;gap:14px
+}
+.header{display:flex;align-items:center;gap:10px}
+.badge{
+	padding:2px 8px;border-radius:10px;font-size:.8em;white-space:nowrap;
+	background:var(--vscode-badge-background,#4d4d4d);
+	color:var(--vscode-badge-foreground,#fff)
+}
+.badge.ok{background:var(--vscode-testing-iconPassed,#4ec9b0);color:#000}
+.badge.err{background:var(--vscode-inputValidation-errorBackground,#5a1d1d);color:var(--vscode-inputValidation-errorForeground,#f48771)}
+.desc{color:var(--vscode-descriptionForeground,#888);font-size:.9em;line-height:1.5em;max-width:520px}
+hr{border:none;border-top:1px solid var(--vscode-widget-border,#454545)}
+.section-title{
+	font-size:.75em;text-transform:uppercase;letter-spacing:.06em;
+	color:var(--vscode-descriptionForeground,#888);margin-bottom:8px
+}
+.stat-grid{
+	display:grid;grid-template-columns:max-content 1fr;
+	gap:5px 18px;align-items:baseline
+}
+.stat-label{color:var(--vscode-descriptionForeground,#888);font-size:.9em;white-space:nowrap}
+.stat-value{font-size:.9em;font-variant-numeric:tabular-nums}
+.mono{font-family:var(--vscode-editor-font-family,monospace);font-size:.85em}
+.pbar{background:var(--vscode-editorWidget-border,#454545);height:3px;border-radius:2px;overflow:hidden;margin-top:4px}
+.pbar-fill{background:var(--vscode-progressBar-background,#0e70c0);height:100%;width:0%;transition:width .1s ease}
+#embed-section{flex-direction:column;gap:4px;display:none}
+#embed-label{font-size:.85em}
+#embed-detail{font-size:.8em;color:var(--vscode-descriptionForeground,#666);font-family:var(--vscode-editor-font-family,monospace)}
+</style>
 </head>
-<body style="font-family:var(--vscode-font-family,sans-serif);font-size:var(--vscode-font-size,13px);background:var(--vscode-editor-background,#1e1e1e);color:var(--vscode-editor-foreground,#d4d4d4);padding:20px;display:flex;flex-direction:column;gap:12px">
+<body>
 
-<div style="display:flex;align-items:center;gap:10px">
-	<span style="font-size:1.2em">&#x2699;&#xFE0F;</span>
+<div class="header">
+	<span style="font-size:1.15em">&#x2699;&#xFE0F;</span>
 	<strong>IntelliSearch Embedding Worker</strong>
-	<span id="status" style="font-size:.8em;padding:2px 8px;border-radius:10px;background:var(--vscode-badge-background,#4d4d4d);color:var(--vscode-badge-foreground,#fff)">Loading model&#x2026;</span>
+	<span id="status" class="badge">Loading model&#x2026;</span>
 </div>
 
-<p style="color:var(--vscode-descriptionForeground,#888);font-size:.9em;line-height:1.5em;max-width:480px">
-	This tab runs the ONNX embedding model (jina-embeddings-v2-base-code) used by
-	IntelliSearch to build the index and power semantic search.
-	<strong style="color:var(--vscode-editor-foreground,#d4d4d4)">Please do not close it</strong> — if you do,
-	it will be recreated automatically the next time a search or index build is triggered.
+<p class="desc">
+	Runs the ONNX embedding model (<span class="mono">jina-embeddings-v2-base-code</span>) used by IntelliSearch.
+	<strong style="color:var(--vscode-editor-foreground,#d4d4d4)">Please do not close this tab</strong> &#x2014;
+	if you do, it will be recreated automatically the next time a search or build is triggered.
 </p>
+
+<hr>
+
+<div id="embed-section">
+	<div class="section-title">Embedding</div>
+	<div id="embed-label">&#x2026;</div>
+	<div class="pbar"><div class="pbar-fill" id="embed-fill"></div></div>
+	<div id="embed-detail"></div>
+</div>
+
+<div>
+	<div class="section-title">Index</div>
+	<div class="stat-grid">
+		<span class="stat-label">Chunks</span>        <span id="s-chunks" class="stat-value">&#x2014;</span>
+		<span class="stat-label">Files indexed</span> <span id="s-files"  class="stat-value">&#x2014;</span>
+		<span class="stat-label">Last full build</span><span id="s-build"  class="stat-value">&#x2014;</span>
+		<span class="stat-label">Last update</span>   <span id="s-update" class="stat-value">&#x2014;</span>
+		<span class="stat-label">Last search</span>   <span id="s-search" class="stat-value">&#x2014;</span>
+	</div>
+</div>
+
 <script type="module">
 const vscode = acquireVsCodeApi();
-const statusEl = document.getElementById('status');
 
+// DOM refs
+const statusEl   = document.getElementById('status');
+const embedSec   = document.getElementById('embed-section');
+const embedLabel = document.getElementById('embed-label');
+const embedFill  = document.getElementById('embed-fill');
+const embedDetail= document.getElementById('embed-detail');
+const sChunks    = document.getElementById('s-chunks');
+const sFiles     = document.getElementById('s-files');
+const sBuild     = document.getElementById('s-build');
+const sUpdate    = document.getElementById('s-update');
+const sSearch    = document.getElementById('s-search');
+
+// Stored timestamps for live refresh
+let tsFullBuild     = null;
+let tsIncremental   = null;
+let tsLastSearch    = null;
+let incrChanged     = 0;
+let incrDeleted     = 0;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 function setStatus(text, ok) {
 	statusEl.textContent = text;
-	statusEl.style.background = ok
-		? 'var(--vscode-testing-iconPassed,#4ec9b0)'
-		: ok === false
-			? 'var(--vscode-inputValidation-errorBackground,#5a1d1d)'
-			: 'var(--vscode-badge-background,#4d4d4d)';
-	statusEl.style.color = ok === true ? '#000' : 'var(--vscode-badge-foreground,#fff)';
+	statusEl.className = 'badge' + (ok === true ? ' ok' : ok === false ? ' err' : '');
 }
+
+function fmt(n) { return n == null ? '\u2014' : n.toLocaleString(); }
+
+function relTime(ts) {
+	if (!ts) { return '\u2014'; }
+	const diff = Date.now() - ts;
+	if (diff < 5_000)    { return 'Just now'; }
+	if (diff < 60_000)   { return Math.floor(diff / 1_000) + 's ago'; }
+	if (diff < 3_600_000){ return Math.floor(diff / 60_000) + ' min ago'; }
+	const d = new Date(ts);
+	return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function refreshTimes() {
+	sBuild.textContent  = tsFullBuild   ? relTime(tsFullBuild)   : '\u2014';
+	sUpdate.textContent = tsIncremental
+		? relTime(tsIncremental) + ' \u2014 ' + incrChanged + ' changed, ' + incrDeleted + ' deleted'
+		: '\u2014';
+	sSearch.textContent = tsLastSearch  ? relTime(tsLastSearch)  : '\u2014';
+}
+setInterval(refreshTimes, 15_000);
 
 // ---------------------------------------------------------------------------
 // Float32 <-> Base64
@@ -51,8 +144,7 @@ function float32ToBase64(arr) {
 }
 
 // ---------------------------------------------------------------------------
-// Model initialisation — begin immediately on page load so ONNX Runtime
-// WASM worker starts in a clean context well before any embed request.
+// Model initialisation
 // ---------------------------------------------------------------------------
 const modelReadyPromise = (async () => {
 	try {
@@ -81,41 +173,69 @@ window.addEventListener('message', async e => {
 	const msg = e.data;
 	switch (msg.type) {
 
-		// Batch-embed all chunks for an index build ----------------------------
+		// Index stats pushed from extension host ----------------------------------
+		case 'indexStats': {
+			sChunks.textContent = fmt(msg.chunkCount);
+			sFiles.textContent  = fmt(msg.fileCount);
+			tsFullBuild = msg.lastFullBuild ?? null;
+			if (msg.lastIncremental) {
+				tsIncremental = msg.lastIncremental.time;
+				incrChanged   = msg.lastIncremental.changedCount;
+				incrDeleted   = msg.lastIncremental.deletedCount;
+			}
+			refreshTimes();
+			break;
+		}
+
+		// Batch-embed all chunks for an index build -------------------------------
 		case 'startEmbedding': {
 			const model  = await modelReadyPromise;
-			const chunks = msg.chunks;           // Array<{ text, file }>
+			const chunks = msg.chunks;
 			const DIM    = 768;
-			const allVec = new Float32Array(chunks.length * DIM);
+			const total  = chunks.length;
+			const allVec = new Float32Array(total * DIM);
 
-			for (let i = 0; i < chunks.length; i++) {
+			embedLabel.textContent = 'Embedding ' + total.toLocaleString() + ' chunks\u2026';
+			embedFill.style.width  = '0%';
+			embedDetail.textContent = '';
+			embedSec.style.display = 'flex';
+			const startTime = Date.now();
+
+			for (let i = 0; i < total; i++) {
 				try {
 					const out = await model(chunks[i].text, { pooling: 'mean', normalize: true });
 					allVec.set(out.data, i * DIM);
 				} catch {
 					// leave as zero vector
 				}
-				vscode.postMessage({
-					type: 'embedProgress',
-					done:  i + 1,
-					total: chunks.length,
-					file:  chunks[i].file ?? '',
-				});
+				const done = i + 1;
+				const pct  = (done / total) * 100;
+				embedFill.style.width = pct + '%';
+				const elapsed = Date.now() - startTime;
+				const eta     = done > 1 ? Math.round((elapsed / done) * (total - done) / 1000) : null;
+				const etaStr  = eta !== null && eta > 0
+					? ' \u2014 ~' + (eta >= 60 ? Math.floor(eta / 60) + 'm ' + (eta % 60) + 's' : eta + 's') + ' left'
+					: '';
+				embedDetail.textContent = done.toLocaleString() + ' / ' + total.toLocaleString()
+					+ '  \u2014  ' + (chunks[i].file ?? '') + etaStr;
+				vscode.postMessage({ type: 'embedProgress', done, total, file: chunks[i].file ?? '' });
 			}
 
+			embedSec.style.display = 'none';
 			vscode.postMessage({ type: 'embeddingsDone', vectors: float32ToBase64(allVec) });
 			break;
 		}
 
-		// Single-query embed for search ----------------------------------------
+		// Single-query embed for search -------------------------------------------
 		case 'embedQuery': {
 			const { requestId, query } = msg;
+			tsLastSearch = Date.now();
+			sSearch.textContent = '\u201c' + query.slice(0, 50) + (query.length > 50 ? '\u2026' : '') + '\u201d';
 			try {
 				const model = await modelReadyPromise;
 				const out   = await model(query, { pooling: 'mean', normalize: true });
 				vscode.postMessage({
-					type:      'queryEmbedding',
-					requestId,
+					type: 'queryEmbedding', requestId,
 					vector: float32ToBase64(new Float32Array(out.data)),
 				});
 			} catch (err) {
@@ -125,6 +245,9 @@ window.addEventListener('message', async e => {
 		}
 	}
 });
+
+// Announce ready so the extension can re-send cached stats.
+vscode.postMessage({ type: 'workerWebviewReady' });
 </script>
 </body>
 </html>

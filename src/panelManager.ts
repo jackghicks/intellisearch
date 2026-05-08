@@ -3,7 +3,7 @@ import { chunkFile, isIndexable, RawChunk } from './chunker';
 import { saveIndex, loadIndex, indexExists } from './indexStore';
 import { Chunk, IndexData, MetaJson } from './types';
 import { MODEL_NAME, VECTOR_DIM, ALWAYS_EXCLUDE } from './utils';
-import { embedBatch, embedQuery } from './embeddingWorker';
+import { embedBatch, embedQuery, postWorkerStatus } from './embeddingWorker';
 import panelHtml from './webview/panel.html';
 
 // ---------------------------------------------------------------------------
@@ -20,6 +20,9 @@ let inMemoryIndex: { data: IndexData; vectors: Float32Array } | null = null;
 /** Guards against running a full build and an incremental update concurrently. */
 let isFullBuildInProgress = false;
 let isIncrementalUpdating = false;
+
+/** Timestamp of the most recent full build (ms). */
+let lastFullBuildTime: number | null = null;
 
 // ---------------------------------------------------------------------------
 // Panel management
@@ -242,7 +245,16 @@ async function doBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 	console.log(`[intellisearch] saving index — ${chunks.length} chunks`);
 	await saveIndex(workspaceUri, indexData, vectors);
 	inMemoryIndex = { data: indexData, vectors };
+	lastFullBuildTime = Date.now();
 	console.log('[intellisearch] index saved to disk');
+
+	postWorkerStatus({
+		type: 'indexStats',
+		chunkCount:     chunks.length,
+		fileCount:      Object.keys(fileMeta).length,
+		lastFullBuild:  lastFullBuildTime,
+		lastIncremental: null,
+	});
 
 	panel?.webview.postMessage({ type: 'indexSaved', meta });
 }
@@ -253,6 +265,15 @@ async function sendIndexToWebview(workspaceUri: vscode.Uri): Promise<void> {
 	if (!loaded) { console.warn('[intellisearch] loadIndex returned null'); return; }
 	inMemoryIndex = loaded;
 	console.log(`[intellisearch] index loaded — ${loaded.data.chunks.length} chunks`);
+
+	postWorkerStatus({
+		type:            'indexStats',
+		chunkCount:      loaded.data.chunks.length,
+		fileCount:       Object.keys(loaded.data.files).length,
+		lastFullBuild:   loaded.data.meta.created,
+		lastIncremental: null,
+	});
+
 	panel?.webview.postMessage({
 		type:       'loadIndex',
 		chunkCount: loaded.data.chunks.length,
@@ -415,6 +436,18 @@ async function doIncrementalUpdate(
 		`[intellisearch] incremental: +${toReindex.length} re-indexed, ` +
 		`-${toDelete.length} deleted, total ${allChunks.length} chunks`,
 	);
+
+	postWorkerStatus({
+		type:         'indexStats',
+		chunkCount:   allChunks.length,
+		fileCount:    Object.keys(fileMeta).length,
+		lastFullBuild: lastFullBuildTime,
+		lastIncremental: {
+			time:         Date.now(),
+			changedCount: toReindex.length,
+			deletedCount: toDelete.length,
+		},
+	});
 
 	// Notify the UI panel (if open) so the badge stays current.
 	panel?.webview.postMessage({

@@ -11,6 +11,9 @@ let isModelReady = false;
 /** Held so the panel can be recreated automatically if the user closes it. */
 let savedContext: vscode.ExtensionContext | undefined;
 
+/** Last index stats message — re-sent whenever the panel is recreated. */
+let lastIndexStats: Record<string, unknown> | null = null;
+
 /** Pending single-query embed requests, keyed by requestId. */
 const pendingQueryRequests = new Map<string, {
 	query:   string;
@@ -74,6 +77,13 @@ function createWorkerPanel(context: vscode.ExtensionContext): void {
 // ---------------------------------------------------------------------------
 function handleMessage(msg: Record<string, unknown>): void {
 	switch (msg.type) {
+
+		// Webview script finished loading — re-send cached stats if available ---
+		case 'workerWebviewReady':
+			if (lastIndexStats) {
+				workerPanel?.webview.postMessage(lastIndexStats);
+			}
+			break;
 
 		case 'modelReady':
 			isModelReady = true;
@@ -142,6 +152,15 @@ export function embedBatch(
 		batchCallbacks = { onProgress, resolve, reject };
 		workerPanel!.webview.postMessage({ type: 'startEmbedding', chunks });
 	});
+}
+
+/**
+ * Send index stats or any status message to the worker panel's UI.
+ * The message is cached and re-delivered if the panel is recreated.
+ */
+export function postWorkerStatus(msg: Record<string, unknown>): void {
+	lastIndexStats = msg;
+	workerPanel?.webview.postMessage(msg);
 }
 
 /**
