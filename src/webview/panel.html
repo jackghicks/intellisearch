@@ -282,6 +282,10 @@ window.addEventListener('message', async e => {
 			btnSearch.disabled = false;
 			break;
 
+		case 'incrementalUpdate':
+			setBadge(msg.chunkCount + ' chunks indexed', 'ok');
+			break;
+
 		case 'error':
 			hideProgress();
 			hideEmbedProgress();

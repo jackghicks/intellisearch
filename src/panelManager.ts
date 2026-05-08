@@ -17,6 +17,10 @@ let pendingAutoBuild = false;
 /** Index held in extension-host memory for fast search. */
 let inMemoryIndex: { data: IndexData; vectors: Float32Array } | null = null;
 
+/** Guards against running a full build and an incremental update concurrently. */
+let isFullBuildInProgress = false;
+let isIncrementalUpdating = false;
+
 // ---------------------------------------------------------------------------
 // Panel management
 // ---------------------------------------------------------------------------
@@ -134,6 +138,15 @@ async function handleMessage(
 // ---------------------------------------------------------------------------
 async function runBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 	console.log('[intellisearch] runBuildIndex start');
+	isFullBuildInProgress = true;
+	try {
+		await doBuildIndex(workspaceUri);
+	} finally {
+		isFullBuildInProgress = false;
+	}
+}
+
+async function doBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 	const files = await vscode.workspace.findFiles('**/*', ALWAYS_EXCLUDE);
 	const indexable = files.filter(isIndexable);
 	console.log(`[intellisearch] findFiles done — total=${files.length}, indexable=${indexable.length}`);
@@ -141,6 +154,7 @@ async function runBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 	panel?.webview.postMessage({ type: 'chunkStart', total: indexable.length });
 
 	const rawChunks: RawChunk[] = [];
+	const fileMtimes = new Map<string, number>();
 
 	for (let i = 0; i < indexable.length; i++) {
 		const uri = indexable[i];
@@ -151,9 +165,15 @@ async function runBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 			file: uri.path.split('/').pop() ?? '',
 		});
 		try {
-			const chunks = await chunkFile(uri, workspaceUri.path);
+			const [chunks, stat] = await Promise.all([
+				chunkFile(uri, workspaceUri.path),
+				vscode.workspace.fs.stat(uri).then(s => s, () => null),
+			]);
 			console.log(`[intellisearch]   → ${chunks.length} chunk(s) from ${uri.path.split('/').pop()}`);
 			rawChunks.push(...chunks);
+			if (stat) {
+				fileMtimes.set(uriToRelPath(uri, workspaceUri), stat.mtime);
+			}
 		} catch (err) {
 			console.warn('[intellisearch] skip', uri.path, err);
 		}
@@ -203,6 +223,10 @@ async function runBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 		fm.chunkCount += 1;
 		fileMeta[rc.file] = fm;
 	}
+	// Populate real mtimes captured during chunking.
+	for (const [rel, mtime] of fileMtimes) {
+		if (fileMeta[rel]) { fileMeta[rel].mtime = mtime; }
+	}
 
 	const meta: MetaJson = {
 		version: 1,
@@ -233,6 +257,171 @@ async function sendIndexToWebview(workspaceUri: vscode.Uri): Promise<void> {
 		type:       'loadIndex',
 		chunkCount: loaded.data.chunks.length,
 		meta:       loaded.data.meta,
+	});
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function uriToRelPath(uri: vscode.Uri, workspaceUri: vscode.Uri): string {
+	return uri.path.startsWith(workspaceUri.path + '/')
+		? uri.path.slice(workspaceUri.path.length + 1)
+		: uri.path;
+}
+
+// ---------------------------------------------------------------------------
+// Incremental index update  (called by the file watcher in extension.ts)
+// ---------------------------------------------------------------------------
+export async function runIncrementalUpdate(
+	workspaceUri: vscode.Uri,
+	changed: vscode.Uri[],
+	deleted: vscode.Uri[],
+): Promise<void> {
+	// If a full build is running, it will produce a fresh index — skip.
+	if (isFullBuildInProgress || isIncrementalUpdating) { return; }
+
+	// Ignore non-indexable files and anything inside .intellisearch/.
+	const toReindex = changed.filter(
+		u => isIndexable(u) && !u.path.includes('/.intellisearch/'),
+	);
+	const toDelete = deleted.filter(
+		u => isIndexable(u) && !u.path.includes('/.intellisearch/'),
+	);
+
+	if (toReindex.length === 0 && toDelete.length === 0) { return; }
+
+	// Need an existing index to update.
+	if (!inMemoryIndex) {
+		const loaded = await loadIndex(workspaceUri);
+		if (!loaded) { return; }
+		inMemoryIndex = loaded;
+	}
+
+	isIncrementalUpdating = true;
+	try {
+		await doIncrementalUpdate(workspaceUri, toReindex, toDelete);
+	} finally {
+		isIncrementalUpdating = false;
+	}
+}
+
+async function doIncrementalUpdate(
+	workspaceUri: vscode.Uri,
+	toReindex: vscode.Uri[],
+	toDelete: vscode.Uri[],
+): Promise<void> {
+	const index = inMemoryIndex!;
+
+	// Relative paths being removed: deleted files + old versions of changed files.
+	const removedRel = new Set<string>([
+		...toDelete.map(u => uriToRelPath(u, workspaceUri)),
+		...toReindex.map(u => uriToRelPath(u, workspaceUri)),
+	]);
+
+	// --- 1. Keep chunks whose file is not being touched ----------------------
+	const keepChunks = index.data.chunks.filter(c => !removedRel.has(c.file));
+
+	// --- 2. Re-chunk changed / created files ---------------------------------
+	const rawChunks: RawChunk[] = [];
+	for (const uri of toReindex) {
+		try {
+			const chunks = await chunkFile(uri, workspaceUri.path);
+			rawChunks.push(...chunks);
+		} catch (err) {
+			console.warn('[intellisearch] incremental: skip', uri.path, err);
+		}
+	}
+
+	// --- 3. Embed new chunks (silent — no panel progress) --------------------
+	let newVectors: Float32Array = new Float32Array(rawChunks.length * VECTOR_DIM);
+	if (rawChunks.length > 0) {
+		try {
+			newVectors = await embedBatch(
+				rawChunks.map(rc => ({ text: rc.text, file: rc.file })),
+				() => { /* silent */ },
+			);
+		} catch (err) {
+			console.error('[intellisearch] incremental embedBatch failed:', err);
+			return;
+		}
+	}
+
+	// --- 4. Repack into a contiguous Float32Array, reassigning offsets --------
+	const totalChunks = keepChunks.length + rawChunks.length;
+	const packedVectors = new Float32Array(totalChunks * VECTOR_DIM);
+	const allChunks: Chunk[] = [];
+
+	for (let i = 0; i < keepChunks.length; i++) {
+		const src = index.vectors.subarray(
+			keepChunks[i].vectorOffset,
+			keepChunks[i].vectorOffset + VECTOR_DIM,
+		);
+		packedVectors.set(src, i * VECTOR_DIM);
+		allChunks.push({ ...keepChunks[i], id: i, vectorOffset: i * VECTOR_DIM });
+	}
+
+	for (let i = 0; i < rawChunks.length; i++) {
+		const globalIdx = keepChunks.length + i;
+		packedVectors.set(
+			newVectors.subarray(i * VECTOR_DIM, (i + 1) * VECTOR_DIM),
+			globalIdx * VECTOR_DIM,
+		);
+		allChunks.push({
+			id:          globalIdx,
+			file:        rawChunks[i].file,
+			range:       rawChunks[i].range,
+			tokenCount:  rawChunks[i].tokenCount,
+			preview:     rawChunks[i].preview,
+			symbolName:  rawChunks[i].symbolName,
+			vectorOffset: globalIdx * VECTOR_DIM,
+		});
+	}
+
+	// --- 5. Rebuild file metadata --------------------------------------------
+	const fileMeta: IndexData['files'] = {};
+	for (const chunk of allChunks) {
+		const fm = fileMeta[chunk.file] ?? { mtime: 0, chunkCount: 0 };
+		fm.chunkCount += 1;
+		fileMeta[chunk.file] = fm;
+	}
+	// Carry over stored mtimes for untouched files.
+	for (const [file, stored] of Object.entries(index.data.files)) {
+		if (fileMeta[file] && !removedRel.has(file)) {
+			fileMeta[file].mtime = stored.mtime;
+		}
+	}
+	// Set fresh mtimes for re-indexed files.
+	for (const uri of toReindex) {
+		const rel = uriToRelPath(uri, workspaceUri);
+		if (fileMeta[rel]) {
+			try {
+				const stat = await vscode.workspace.fs.stat(uri);
+				fileMeta[rel].mtime = stat.mtime;
+			} catch { /* ignore */ }
+		}
+	}
+
+	// --- 6. Save -------------------------------------------------------------
+	const updatedMeta: MetaJson = {
+		...index.data.meta,
+		chunkCount: allChunks.length,
+		created: Date.now(),
+	};
+	const indexData: IndexData = { meta: updatedMeta, chunks: allChunks, files: fileMeta };
+	await saveIndex(workspaceUri, indexData, packedVectors);
+	inMemoryIndex = { data: indexData, vectors: packedVectors };
+
+	console.log(
+		`[intellisearch] incremental: +${toReindex.length} re-indexed, ` +
+		`-${toDelete.length} deleted, total ${allChunks.length} chunks`,
+	);
+
+	// Notify the UI panel (if open) so the badge stays current.
+	panel?.webview.postMessage({
+		type:         'incrementalUpdate',
+		chunkCount:   allChunks.length,
+		changedCount: toReindex.length,
+		deletedCount: toDelete.length,
 	});
 }
 
