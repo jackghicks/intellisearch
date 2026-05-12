@@ -44,7 +44,7 @@ export async function openPanel(context: vscode.ExtensionContext): Promise<void>
 		{ enableScripts: true, retainContextWhenHidden: true },
 	);
 
-	panel.webview.html = panelHtml;
+	panel.webview.html = panelHtml.replace('__CSP_SOURCE__', panel.webview.cspSource);
 
 	panel.webview.onDidReceiveMessage(
 		(msg) => handleMessage(msg, context),

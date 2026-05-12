@@ -50,16 +50,25 @@ function ensureWorkerPanel(): void {
 }
 
 function createWorkerPanel(context: vscode.ExtensionContext): void {
+	const distWebUri = vscode.Uri.joinPath(context.extensionUri, 'dist', 'web');
+
 	workerPanel = vscode.window.createWebviewPanel(
 		'intellisearch.worker',
 		'IntelliSearch Worker',
 		{ viewColumn: vscode.ViewColumn.Two, preserveFocus: true },
-		{ enableScripts: true, retainContextWhenHidden: true },
+		{ enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [distWebUri] },
 	);
 
-	workerPanel.webview.html = workerHtml;
+	const webview = workerPanel.webview;
+	const transformersUri = webview.asWebviewUri(vscode.Uri.joinPath(distWebUri, 'transformers.min.js')).toString();
+	const wasmDirUri      = webview.asWebviewUri(distWebUri).toString() + '/';
 
-	workerPanel.webview.onDidReceiveMessage(handleMessage, undefined, context.subscriptions);
+	webview.html = workerHtml
+		.replace('__CSP_SOURCE__', webview.cspSource)
+		.replace('__TRANSFORMERS_URI__', transformersUri)
+		.replace('__WASM_DIR_URI__', wasmDirUri);
+
+	webview.onDidReceiveMessage(handleMessage, undefined, context.subscriptions);
 
 	workerPanel.onDidDispose(() => {
 		workerPanel   = undefined;

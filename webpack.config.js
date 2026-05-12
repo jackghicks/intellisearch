@@ -4,6 +4,7 @@
 
 const path = require('path');
 const webpack = require('webpack');
+const CopyPlugin = require('copy-webpack-plugin');
 
 /** @typedef {import('webpack').Configuration} WebpackConfig **/
 
@@ -52,6 +53,30 @@ const webExtensionConfig = {
 		}),
 		new webpack.ProvidePlugin({
 			process: 'process/browser', // shim for the global `process` variable
+		}),
+		new CopyPlugin({
+			patterns: [
+				{
+					from: path.join(__dirname, 'node_modules', '@xenova', 'transformers', 'dist', 'transformers.min.js'),
+					to: path.join(__dirname, 'dist', 'web', 'transformers.min.js'),
+				},
+				{
+					from: path.join(__dirname, 'node_modules', '@xenova', 'transformers', 'dist', 'ort-wasm.wasm'),
+					to: path.join(__dirname, 'dist', 'web', 'ort-wasm.wasm'),
+				},
+				{
+					from: path.join(__dirname, 'node_modules', '@xenova', 'transformers', 'dist', 'ort-wasm-simd.wasm'),
+					to: path.join(__dirname, 'dist', 'web', 'ort-wasm-simd.wasm'),
+				},
+				{
+					from: path.join(__dirname, 'node_modules', '@xenova', 'transformers', 'dist', 'ort-wasm-threaded.wasm'),
+					to: path.join(__dirname, 'dist', 'web', 'ort-wasm-threaded.wasm'),
+				},
+				{
+					from: path.join(__dirname, 'node_modules', '@xenova', 'transformers', 'dist', 'ort-wasm-simd-threaded.wasm'),
+					to: path.join(__dirname, 'dist', 'web', 'ort-wasm-simd-threaded.wasm'),
+				},
+			],
 		}),
 	],
 	externals: {
