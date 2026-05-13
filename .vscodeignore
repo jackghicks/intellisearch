@@ -1,4 +1,10 @@
 .vscode/
+.vscode-test-web/
 node_modules/
-dist/
+src/
+webpack.config.js
+tsconfig.json
+eslint.config.mjs
+package-lock.json
 *.vsix
+dist/**/*.map
