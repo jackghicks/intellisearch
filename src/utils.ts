@@ -1,15 +1,29 @@
+import * as vscode from 'vscode';
+
 // ---------------------------------------------------------------------------
 // Shared constants
 // ---------------------------------------------------------------------------
 export const MODEL_NAME = 'jinaai/jina-embeddings-v2-base-code';
 export const VECTOR_DIM = 768;
 
-// Passing `undefined` as the exclude argument to findFiles makes VS Code merge
-// files.exclude + search.exclude settings AND honour .gitignore files
-// (controlled by the search.useIgnoreFiles setting, which is on by default).
-// We only hard-exclude .intellisearch/ ourselves — everything else is left to
-// VS Code / gitignore so that user configuration is respected.
 export const ALWAYS_EXCLUDE = '**/.intellisearch/**';
+
+/**
+ * Builds a glob pattern that combines VS Code's files.exclude + search.exclude
+ * settings (the same sources used by Find in Files' "Use Exclude Settings")
+ * together with our own .intellisearch exclusion.
+ */
+export function buildExcludeGlob(): string {
+	const filesExclude = vscode.workspace.getConfiguration('files').get<Record<string, boolean>>('exclude') ?? {};
+	const searchExclude = vscode.workspace.getConfiguration('search').get<Record<string, boolean>>('exclude') ?? {};
+	const patterns = [
+		ALWAYS_EXCLUDE,
+		...Object.entries({ ...filesExclude, ...searchExclude })
+			.filter(([, enabled]) => enabled)
+			.map(([pattern]) => pattern),
+	];
+	return patterns.length === 1 ? patterns[0] : `{${patterns.join(',')}}`;
+}
 
 // ---------------------------------------------------------------------------
 // Float32 ↔ Base64  (btoa / atob are available in the web-worker host)

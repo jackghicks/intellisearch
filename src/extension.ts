@@ -1,6 +1,6 @@
 ﻿import * as vscode from 'vscode';
-import { openPanel, setPendingAutoBuild, runIncrementalUpdate } from './panelManager';
-import { initEmbeddingWorker } from './embeddingWorker';
+import { IntelliSearchViewProvider, openPanel, setPendingAutoBuild, runIncrementalUpdate } from './panelManager';
+import { initEmbeddingWorker, IntelliSearchWorkerProvider } from './embeddingWorker';
 import { IntelliSearchTool } from './searchTool';
 
 // ---------------------------------------------------------------------------
@@ -11,18 +11,29 @@ export function activate(context: vscode.ExtensionContext): void {
 	// loading before the user opens the panel.
 	initEmbeddingWorker(context);
 
+	const provider = new IntelliSearchViewProvider(context);
+	const workerProvider = new IntelliSearchWorkerProvider(context);
+
 	context.subscriptions.push(
+		vscode.window.registerWebviewViewProvider(
+			IntelliSearchViewProvider.viewType,
+			provider,
+			{ webviewOptions: { retainContextWhenHidden: true } },
+		),
+		vscode.window.registerWebviewViewProvider(
+			IntelliSearchWorkerProvider.viewType,
+			workerProvider,
+			{ webviewOptions: { retainContextWhenHidden: true } },
+		),
 		vscode.commands.registerCommand('intellisearch.openPanel', () =>
-			openPanel(context),
+			openPanel(),
 		),
 		vscode.commands.registerCommand('intellisearch.buildIndex', () => {
 			setPendingAutoBuild(true);
-			openPanel(context);
+			openPanel();
 		}),
 		vscode.lm.registerTool('intellisearch_search', new IntelliSearchTool(context)),
 	);
-
-	openPanel(context);
 
 	// -------------------------------------------------------------------------
 	// File watcher — keep the index incrementally up to date.

@@ -32,8 +32,25 @@ const INDEXABLE_EXT = new Set([
 	'.css', '.scss', '.less', '.sql',
 ]);
 
+/** Auto-generated / lock files that are large and semantically useless to index. */
+const EXCLUDED_FILENAMES = new Set([
+	'package-lock.json',
+	'npm-shrinkwrap.json',
+	'yarn.lock',
+	'pnpm-lock.yaml',
+	'bun.lock',
+	'composer.lock',
+	'gemfile.lock',
+	'cargo.lock',
+	'poetry.lock',
+	'pipfile.lock',
+	'packages.lock.json',
+]);
+
 export function isIndexable(uri: vscode.Uri): boolean {
 	const lower = uri.path.toLowerCase();
+	const filename = lower.slice(lower.lastIndexOf('/') + 1);
+	if (EXCLUDED_FILENAMES.has(filename)) { return false; }
 	const dot = lower.lastIndexOf('.');
 	return dot !== -1 && INDEXABLE_EXT.has(lower.slice(dot));
 }

@@ -3,7 +3,7 @@
   "displayName": "IntelliSearch",
   "description": "Semantic search for your codebase using local AI embeddings. Find code by concept, not just keywords.",
   "version": "0.0.1",
-  "publisher": "TODO",
+  "publisher": "JackGHicks",
   "repository": {
     "type": "git",
     "url": "https://github.com/jackghicks/intellisearch"
@@ -30,6 +30,29 @@
   ],
   "browser": "./dist/web/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "intellisearch-sidebar",
+          "title": "IntelliSearch",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "intellisearch-sidebar": [
+        {
+          "type": "webview",
+          "id": "intellisearch.panel",
+          "name": "IntelliSearch"
+        },
+        {
+          "type": "webview",
+          "id": "intellisearch.worker",
+          "name": "Embedding Worker"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "intellisearch.openPanel",
@@ -85,6 +108,7 @@
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
     "@vscode/test-web": "^0.0.80",
+    "@vscode/vsce": "^3.9.1",
     "@xenova/transformers": "^2.17.2",
     "copy-webpack-plugin": "^14.0.0",
     "eslint": "^9.0.0",

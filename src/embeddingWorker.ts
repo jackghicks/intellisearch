@@ -5,11 +5,15 @@ import workerHtml from './webview/worker.html';
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-let workerPanel: vscode.WebviewPanel | undefined;
+let workerView: vscode.WebviewView | undefined;
 let isModelReady = false;
 
-/** Held so the panel can be recreated automatically if the user closes it. */
+/** Held so the view can be recreated automatically if the user closes it. */
 let savedContext: vscode.ExtensionContext | undefined;
+
+/** Resolves when the worker WebviewView has been resolved by VS Code. */
+let resolveViewReady: (() => void) | undefined;
+let viewReadyPromise: Promise<void> = new Promise(r => { resolveViewReady = r; });
 
 /** Last index stats message — re-sent whenever the panel is recreated. */
 let lastIndexStats: Record<string, unknown> | null = null;
@@ -29,56 +33,76 @@ let batchCallbacks: {
 } | undefined;
 
 // ---------------------------------------------------------------------------
+// Sidebar WebviewView provider
+// ---------------------------------------------------------------------------
+export class IntelliSearchWorkerProvider implements vscode.WebviewViewProvider {
+	public static readonly viewType = 'intellisearch.worker';
+
+	constructor(private readonly _context: vscode.ExtensionContext) {
+		savedContext = _context;
+	}
+
+	public resolveWebviewView(
+		webviewView: vscode.WebviewView,
+		_resolveContext: vscode.WebviewViewResolveContext,
+		_token: vscode.CancellationToken,
+	): void {
+		workerView = webviewView;
+
+		const distWebUri = vscode.Uri.joinPath(this._context.extensionUri, 'dist', 'web');
+		webviewView.webview.options = {
+			enableScripts: true,
+			localResourceRoots: [distWebUri],
+		};
+
+		const webview = webviewView.webview;
+		const transformersUri = webview.asWebviewUri(vscode.Uri.joinPath(distWebUri, 'transformers.min.js')).toString();
+		const wasmDirUri      = webview.asWebviewUri(distWebUri).toString() + '/';
+
+		webview.html = workerHtml
+			.replace('__CSP_SOURCE__', webview.cspSource)
+			.replace('__TRANSFORMERS_URI__', transformersUri)
+			.replace('__WASM_DIR_URI__', wasmDirUri);
+
+		webview.onDidReceiveMessage(handleMessage, undefined, this._context.subscriptions);
+
+		webviewView.onDidDispose(() => {
+			workerView   = undefined;
+			isModelReady = false;
+			const err = new Error('IntelliSearch embedding worker was closed.');
+			for (const req of pendingQueryRequests.values()) { req.reject(err); }
+			pendingQueryRequests.clear();
+			batchCallbacks?.reject(err);
+			batchCallbacks = undefined;
+			// Reset ready promise so ensureWorkerView works after re-open.
+			viewReadyPromise = new Promise(r => { resolveViewReady = r; });
+		});
+
+		// Signal that the view is now available.
+		resolveViewReady?.();
+		resolveViewReady = undefined;
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Initialisation
 // ---------------------------------------------------------------------------
 
 /**
- * Creates the background embedding worker panel.  Call once from `activate`.
- * Uses `preserveFocus: true` so it doesn't steal the user's active editor.
+ * Triggers the background embedding worker view to load.  Call once from `activate`.
  */
 export function initEmbeddingWorker(context: vscode.ExtensionContext): void {
 	savedContext = context;
-	if (workerPanel) { return; }
-	createWorkerPanel(context);
+	// Focus the worker view so VS Code resolves it and the WASM model
+	// begins loading immediately, before the user opens the main panel.
+	vscode.commands.executeCommand('intellisearch.worker.focus');
 }
 
-/** Ensures the worker panel exists, recreating it if the user closed it. */
-function ensureWorkerPanel(): void {
-	if (!workerPanel && savedContext) {
-		createWorkerPanel(savedContext);
-	}
-}
-
-function createWorkerPanel(context: vscode.ExtensionContext): void {
-	const distWebUri = vscode.Uri.joinPath(context.extensionUri, 'dist', 'web');
-
-	workerPanel = vscode.window.createWebviewPanel(
-		'intellisearch.worker',
-		'IntelliSearch Worker',
-		{ viewColumn: vscode.ViewColumn.Two, preserveFocus: true },
-		{ enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [distWebUri] },
-	);
-
-	const webview = workerPanel.webview;
-	const transformersUri = webview.asWebviewUri(vscode.Uri.joinPath(distWebUri, 'transformers.min.js')).toString();
-	const wasmDirUri      = webview.asWebviewUri(distWebUri).toString() + '/';
-
-	webview.html = workerHtml
-		.replace('__CSP_SOURCE__', webview.cspSource)
-		.replace('__TRANSFORMERS_URI__', transformersUri)
-		.replace('__WASM_DIR_URI__', wasmDirUri);
-
-	webview.onDidReceiveMessage(handleMessage, undefined, context.subscriptions);
-
-	workerPanel.onDidDispose(() => {
-		workerPanel   = undefined;
-		isModelReady  = false;
-		const err = new Error('IntelliSearch embedding worker was closed.');
-		for (const req of pendingQueryRequests.values()) { req.reject(err); }
-		pendingQueryRequests.clear();
-		batchCallbacks?.reject(err);
-		batchCallbacks = undefined;
-	}, null, context.subscriptions);
+/** Ensures the worker view exists, re-focusing it if the user closed it. */
+async function ensureWorkerView(): Promise<void> {
+	if (workerView) { return; }
+	await vscode.commands.executeCommand('intellisearch.worker.focus');
+	await viewReadyPromise;
 }
 
 // ---------------------------------------------------------------------------
@@ -90,7 +114,7 @@ function handleMessage(msg: Record<string, unknown>): void {
 		// Webview script finished loading — re-send cached stats if available ---
 		case 'workerWebviewReady':
 			if (lastIndexStats) {
-				workerPanel?.webview.postMessage(lastIndexStats);
+				workerView?.webview.postMessage(lastIndexStats);
 			}
 			break;
 
@@ -98,7 +122,7 @@ function handleMessage(msg: Record<string, unknown>): void {
 			isModelReady = true;
 			// Flush any queries that arrived before the model finished loading.
 			for (const [requestId, req] of pendingQueryRequests) {
-				workerPanel?.webview.postMessage({ type: 'embedQuery', requestId, query: req.query });
+				workerView?.webview.postMessage({ type: 'embedQuery', requestId, query: req.query });
 			}
 			break;
 
@@ -149,17 +173,14 @@ function handleMessage(msg: Record<string, unknown>): void {
  * Embed a batch of chunks for an index build.
  * `onProgress` is called after each chunk with (done, total, file).
  */
-export function embedBatch(
+export async function embedBatch(
 	chunks: Array<{ text: string; file: string }>,
 	onProgress: (done: number, total: number, file: string) => void,
 ): Promise<Float32Array> {
-	ensureWorkerPanel();
-	if (!workerPanel) {
-		return Promise.reject(new Error('Embedding worker could not be initialised.'));
-	}
+	await ensureWorkerView();
 	return new Promise<Float32Array>((resolve, reject) => {
 		batchCallbacks = { onProgress, resolve, reject };
-		workerPanel!.webview.postMessage({ type: 'startEmbedding', chunks });
+		workerView!.webview.postMessage({ type: 'startEmbedding', chunks });
 	});
 }
 
@@ -169,18 +190,15 @@ export function embedBatch(
  */
 export function postWorkerStatus(msg: Record<string, unknown>): void {
 	lastIndexStats = msg;
-	workerPanel?.webview.postMessage(msg);
+	workerView?.webview.postMessage(msg);
 }
 
 /**
  * Embed a single search query.  Queued automatically if the model is still
  * loading; times out after 60 s.
  */
-export function embedQuery(query: string): Promise<Float32Array> {
-	ensureWorkerPanel();
-	if (!workerPanel) {
-		return Promise.reject(new Error('Embedding worker could not be initialised.'));
-	}
+export async function embedQuery(query: string): Promise<Float32Array> {
+	await ensureWorkerView();
 	return new Promise<Float32Array>((resolve, reject) => {
 		const requestId = Math.random().toString(36).slice(2);
 		const timer = setTimeout(() => {
@@ -197,7 +215,7 @@ export function embedQuery(query: string): Promise<Float32Array> {
 		});
 
 		if (isModelReady) {
-			workerPanel!.webview.postMessage({ type: 'embedQuery', requestId, query });
+			workerView!.webview.postMessage({ type: 'embedQuery', requestId, query });
 		}
 		// else: flushed automatically when modelReady fires
 	});

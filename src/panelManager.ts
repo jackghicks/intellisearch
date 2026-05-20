@@ -2,14 +2,16 @@ import * as vscode from 'vscode';
 import { chunkFile, isIndexable, RawChunk } from './chunker';
 import { saveIndex, loadIndex, indexExists } from './indexStore';
 import { Chunk, IndexData, MetaJson } from './types';
-import { MODEL_NAME, VECTOR_DIM, ALWAYS_EXCLUDE } from './utils';
+import { MODEL_NAME, VECTOR_DIM, buildExcludeGlob } from './utils';
 import { embedBatch, embedQuery, postWorkerStatus } from './embeddingWorker';
 import panelHtml from './webview/panel.html';
 
 // ---------------------------------------------------------------------------
 // Module-level state
 // ---------------------------------------------------------------------------
-let panel: vscode.WebviewPanel | undefined;
+
+/** The active sidebar WebviewView, set by the provider when the view is first shown. */
+let currentView: vscode.WebviewView | undefined;
 
 /** Deferred flag: true when `intellisearch.buildIndex` was called before the webview initialised. */
 let pendingAutoBuild = false;
@@ -25,40 +27,40 @@ let isIncrementalUpdating = false;
 let lastFullBuildTime: number | null = null;
 
 // ---------------------------------------------------------------------------
+// Sidebar WebviewView provider
+// ---------------------------------------------------------------------------
+export class IntelliSearchViewProvider implements vscode.WebviewViewProvider {
+	public static readonly viewType = 'intellisearch.panel';
+
+	constructor(private readonly _context: vscode.ExtensionContext) {}
+
+	public resolveWebviewView(
+		webviewView: vscode.WebviewView,
+		_resolveContext: vscode.WebviewViewResolveContext,
+		_token: vscode.CancellationToken,
+	): void {
+		currentView = webviewView;
+
+		webviewView.webview.options = { enableScripts: true };
+		webviewView.webview.html = panelHtml.replace('__CSP_SOURCE__', webviewView.webview.cspSource);
+
+		webviewView.webview.onDidReceiveMessage(
+			(msg) => handleMessage(msg, this._context),
+			undefined,
+			this._context.subscriptions,
+		);
+
+		webviewView.onDidDispose(() => {
+			currentView = undefined;
+		});
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Panel management
 // ---------------------------------------------------------------------------
-export async function openPanel(context: vscode.ExtensionContext): Promise<void> {
-	if (panel) {
-		panel.reveal(vscode.ViewColumn.Two);
-		if (pendingAutoBuild) {
-			pendingAutoBuild = false;
-			panel.webview.postMessage({ type: 'triggerBuild' });
-		}
-		return;
-	}
-
-	panel = vscode.window.createWebviewPanel(
-		'intellisearch.panel',
-		'IntelliSearch',
-		vscode.ViewColumn.Two,
-		{ enableScripts: true, retainContextWhenHidden: true },
-	);
-
-	panel.webview.html = panelHtml.replace('__CSP_SOURCE__', panel.webview.cspSource);
-
-	panel.webview.onDidReceiveMessage(
-		(msg) => handleMessage(msg, context),
-		undefined,
-		context.subscriptions,
-	);
-
-	panel.onDidDispose(
-		() => {
-			panel = undefined;
-		},
-		null,
-		context.subscriptions,
-	);
+export async function openPanel(): Promise<void> {
+	await vscode.commands.executeCommand('intellisearch.panel.focus');
 }
 
 export function setPendingAutoBuild(value: boolean): void {
@@ -75,7 +77,7 @@ async function handleMessage(
 	const workspaceUri = vscode.workspace.workspaceFolders?.[0]?.uri;
 
 	if (!workspaceUri) {
-		panel?.webview.postMessage({ type: 'error', message: 'No workspace folder is open.' });
+		currentView?.webview.postMessage({ type: 'error', message: 'No workspace folder is open.' });
 		return;
 	}
 
@@ -87,7 +89,7 @@ async function handleMessage(
 			const autoBuild = pendingAutoBuild && !hasIndex;
 			pendingAutoBuild = false;
 
-			panel?.webview.postMessage({ type: 'init', hasIndex, autoBuild });
+			currentView?.webview.postMessage({ type: 'init', hasIndex, autoBuild });
 
 			if (hasIndex) {
 				await sendIndexToWebview(workspaceUri);
@@ -116,21 +118,21 @@ async function handleMessage(
 		case 'searchQuery': {
 			const query = msg.query as string;
 			if (!inMemoryIndex) {
-				panel?.webview.postMessage({ type: 'searchError', message: 'No index loaded.' });
+				currentView?.webview.postMessage({ type: 'searchError', message: 'No index loaded.' });
 				return;
 			}
 			let queryVector: Float32Array;
 			try {
 				queryVector = await embedQuery(query);
 			} catch (err) {
-				panel?.webview.postMessage({
+				currentView?.webview.postMessage({
 					type: 'searchError',
 					message: (err as Error).message,
 				});
 				return;
 			}
 			const results = cosineSearch(inMemoryIndex, queryVector, 10);
-			panel?.webview.postMessage({ type: 'searchResults', results });
+			currentView?.webview.postMessage({ type: 'searchResults', results });
 			break;
 		}
 	}
@@ -150,18 +152,18 @@ async function runBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 }
 
 async function doBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
-	const files = await vscode.workspace.findFiles('**/*', ALWAYS_EXCLUDE);
+	const files = await vscode.workspace.findFiles('**/*', buildExcludeGlob());
 	const indexable = files.filter(isIndexable);
 	console.log(`[intellisearch] findFiles done — total=${files.length}, indexable=${indexable.length}`);
 
-	panel?.webview.postMessage({ type: 'chunkStart', total: indexable.length });
+	currentView?.webview.postMessage({ type: 'chunkStart', total: indexable.length });
 
 	const rawChunks: RawChunk[] = [];
 	const fileMtimes = new Map<string, number>();
 
 	for (let i = 0; i < indexable.length; i++) {
 		const uri = indexable[i];
-		panel?.webview.postMessage({
+		currentView?.webview.postMessage({
 			type: 'chunkProgress',
 			done: i + 1,
 			total: indexable.length,
@@ -183,7 +185,7 @@ async function doBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 	}
 
 	if (rawChunks.length === 0) {
-		panel?.webview.postMessage({
+		currentView?.webview.postMessage({
 			type: 'error',
 			message: 'No indexable content found in the workspace.',
 		});
@@ -198,12 +200,12 @@ async function doBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 		vectors = await embedBatch(
 			rawChunks.map(rc => ({ text: rc.text, file: rc.file })),
 			(done, total, file) => {
-				panel?.webview.postMessage({ type: 'embedProgress', done, total, file });
+				currentView?.webview.postMessage({ type: 'embedProgress', done, total, file });
 			},
 		);
 	} catch (err) {
 		console.error('[intellisearch] embedBatch failed:', err);
-		panel?.webview.postMessage({
+		currentView?.webview.postMessage({
 			type: 'error',
 			message: `Embedding failed: ${(err as Error).message}`,
 		});
@@ -241,7 +243,7 @@ async function doBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 
 	const indexData: IndexData = { meta, chunks, files: fileMeta };
 
-	panel?.webview.postMessage({ type: 'savingIndex' });
+	currentView?.webview.postMessage({ type: 'savingIndex' });
 	console.log(`[intellisearch] saving index — ${chunks.length} chunks`);
 	await saveIndex(workspaceUri, indexData, vectors);
 	inMemoryIndex = { data: indexData, vectors };
@@ -256,7 +258,7 @@ async function doBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 		lastIncremental: null,
 	});
 
-	panel?.webview.postMessage({ type: 'indexSaved', meta });
+	currentView?.webview.postMessage({ type: 'indexSaved', meta });
 }
 
 async function sendIndexToWebview(workspaceUri: vscode.Uri): Promise<void> {
@@ -274,7 +276,7 @@ async function sendIndexToWebview(workspaceUri: vscode.Uri): Promise<void> {
 		lastIncremental: null,
 	});
 
-	panel?.webview.postMessage({
+	currentView?.webview.postMessage({
 		type:       'loadIndex',
 		chunkCount: loaded.data.chunks.length,
 		meta:       loaded.data.meta,
@@ -301,13 +303,23 @@ export async function runIncrementalUpdate(
 	// If a full build is running, it will produce a fresh index — skip.
 	if (isFullBuildInProgress || isIncrementalUpdating) { return; }
 
-	// Ignore non-indexable files and anything inside .intellisearch/.
-	const toReindex = changed.filter(
-		u => isIndexable(u) && !u.path.includes('/.intellisearch/'),
+	// Ignore non-indexable files and anything VS Code considers excluded
+	// (files.exclude + search.exclude — same sources as Find in Files).
+	const excludeGlob = buildExcludeGlob();
+	const changedIndexable = changed.filter(isIndexable);
+	const toReindexRaw = await Promise.all(
+		changedIndexable.map(async u => {
+			const rel = u.path.slice(workspaceUri.path.length + 1);
+			const found = await vscode.workspace.findFiles(
+				new vscode.RelativePattern(workspaceUri, rel), excludeGlob, 1,
+			);
+			return found.length > 0 ? u : null;
+		}),
 	);
-	const toDelete = deleted.filter(
-		u => isIndexable(u) && !u.path.includes('/.intellisearch/'),
-	);
+	const toReindex = toReindexRaw.filter((u): u is vscode.Uri => u !== null);
+	// Deleted files no longer exist on disk — skip the findFiles check and rely
+	// on isIndexable; anything not in the index is a harmless no-op to remove.
+	const toDelete = deleted.filter(isIndexable);
 
 	if (toReindex.length === 0 && toDelete.length === 0) { return; }
 
@@ -450,7 +462,7 @@ async function doIncrementalUpdate(
 	});
 
 	// Notify the UI panel (if open) so the badge stays current.
-	panel?.webview.postMessage({
+	currentView?.webview.postMessage({
 		type:         'incrementalUpdate',
 		chunkCount:   allChunks.length,
 		changedCount: toReindex.length,
