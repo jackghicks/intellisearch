@@ -5,7 +5,7 @@
 <meta http-equiv="Content-Security-Policy"
 	content="default-src 'none';
 		script-src 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' __CSP_SOURCE__ blob:;
-		connect-src https: blob: data:;
+		connect-src __CSP_SOURCE__ https: blob: data:;
 		worker-src blob:;
 		style-src 'unsafe-inline';">
 <title>IntelliSearch Worker</title>
@@ -149,11 +149,14 @@ function float32ToBase64(arr) {
 const modelReadyPromise = (async () => {
 	try {
 		const { pipeline, env } = await import('__TRANSFORMERS_URI__');
-		env.backends.onnx.wasm.wasmPaths = '__WASM_DIR_URI__';
+		env.backends.onnx.wasm.wasmPaths = {
+			wasm: '__WASM_DIR_URI__ort-wasm-simd-threaded.asyncify.wasm',
+			mjs:  '__WASM_DIR_URI__ort-wasm-simd-threaded.asyncify.mjs',
+		};
 		const extractor = await pipeline(
 			'feature-extraction',
 			'jinaai/jina-embeddings-v2-base-code',
-			{ quantized: true },
+			{ dtype: 'q8' },
 		);
 		vscode.postMessage({ type: 'modelReady' });
 		setStatus('Model ready', true);

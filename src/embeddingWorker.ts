@@ -60,9 +60,9 @@ export class IntelliSearchWorkerProvider implements vscode.WebviewViewProvider {
 		const wasmDirUri      = webview.asWebviewUri(distWebUri).toString() + '/';
 
 		webview.html = workerHtml
-			.replace('__CSP_SOURCE__', webview.cspSource)
+			.replaceAll('__CSP_SOURCE__', webview.cspSource)
 			.replace('__TRANSFORMERS_URI__', transformersUri)
-			.replace('__WASM_DIR_URI__', wasmDirUri);
+			.replaceAll('__WASM_DIR_URI__', wasmDirUri);
 
 		webview.onDidReceiveMessage(handleMessage, undefined, this._context.subscriptions);
 

@@ -57,24 +57,26 @@ const webExtensionConfig = {
 		new CopyPlugin({
 			patterns: [
 				{
-					from: path.join(__dirname, 'node_modules', '@xenova', 'transformers', 'dist', 'transformers.min.js'),
+					from: path.join(__dirname, 'node_modules', '@huggingface', 'transformers', 'dist', 'transformers.min.js'),
 					to: path.join(__dirname, 'dist', 'web', 'transformers.min.js'),
 				},
+				// asyncify variants (Chrome/Electron/Edge)
 				{
-					from: path.join(__dirname, 'node_modules', '@xenova', 'transformers', 'dist', 'ort-wasm.wasm'),
-					to: path.join(__dirname, 'dist', 'web', 'ort-wasm.wasm'),
+					from: path.join(__dirname, 'node_modules', '@huggingface', 'transformers', 'node_modules', 'onnxruntime-web', 'dist', 'ort-wasm-simd-threaded.asyncify.wasm'),
+					to: path.join(__dirname, 'dist', 'web', 'ort-wasm-simd-threaded.asyncify.wasm'),
 				},
 				{
-					from: path.join(__dirname, 'node_modules', '@xenova', 'transformers', 'dist', 'ort-wasm-simd.wasm'),
-					to: path.join(__dirname, 'dist', 'web', 'ort-wasm-simd.wasm'),
+					from: path.join(__dirname, 'node_modules', '@huggingface', 'transformers', 'node_modules', 'onnxruntime-web', 'dist', 'ort-wasm-simd-threaded.asyncify.mjs'),
+					to: path.join(__dirname, 'dist', 'web', 'ort-wasm-simd-threaded.asyncify.mjs'),
 				},
+				// standard variants (Safari)
 				{
-					from: path.join(__dirname, 'node_modules', '@xenova', 'transformers', 'dist', 'ort-wasm-threaded.wasm'),
-					to: path.join(__dirname, 'dist', 'web', 'ort-wasm-threaded.wasm'),
-				},
-				{
-					from: path.join(__dirname, 'node_modules', '@xenova', 'transformers', 'dist', 'ort-wasm-simd-threaded.wasm'),
+					from: path.join(__dirname, 'node_modules', '@huggingface', 'transformers', 'node_modules', 'onnxruntime-web', 'dist', 'ort-wasm-simd-threaded.wasm'),
 					to: path.join(__dirname, 'dist', 'web', 'ort-wasm-simd-threaded.wasm'),
+				},
+				{
+					from: path.join(__dirname, 'node_modules', '@huggingface', 'transformers', 'node_modules', 'onnxruntime-web', 'dist', 'ort-wasm-simd-threaded.mjs'),
+					to: path.join(__dirname, 'dist', 'web', 'ort-wasm-simd-threaded.mjs'),
 				},
 			],
 		}),
