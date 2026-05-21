@@ -2,7 +2,7 @@
   "name": "intellisearch",
   "displayName": "IntelliSearch",
   "description": "Semantic search for your codebase using local AI embeddings. Find code by concept, not just keywords.",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publisher": "JackGHicks",
   "repository": {
     "type": "git",
