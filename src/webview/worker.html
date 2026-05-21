@@ -72,11 +72,12 @@ hr{border:none;border-top:1px solid var(--vscode-widget-border,#454545)}
 <div>
 	<div class="section-title">Index</div>
 	<div class="stat-grid">
-		<span class="stat-label">Chunks</span>        <span id="s-chunks" class="stat-value">&#x2014;</span>
-		<span class="stat-label">Files indexed</span> <span id="s-files"  class="stat-value">&#x2014;</span>
-		<span class="stat-label">Last full build</span><span id="s-build"  class="stat-value">&#x2014;</span>
-		<span class="stat-label">Last update</span>   <span id="s-update" class="stat-value">&#x2014;</span>
-		<span class="stat-label">Last search</span>   <span id="s-search" class="stat-value">&#x2014;</span>
+		<span class="stat-label">Backend</span>        <span id="s-backend" class="stat-value">&#x2014;</span>
+		<span class="stat-label">Chunks</span>         <span id="s-chunks"  class="stat-value">&#x2014;</span>
+		<span class="stat-label">Files indexed</span>  <span id="s-files"   class="stat-value">&#x2014;</span>
+		<span class="stat-label">Last full build</span><span id="s-build"   class="stat-value">&#x2014;</span>
+		<span class="stat-label">Last update</span>    <span id="s-update"  class="stat-value">&#x2014;</span>
+		<span class="stat-label">Last search</span>    <span id="s-search"  class="stat-value">&#x2014;</span>
 	</div>
 </div>
 
@@ -94,6 +95,7 @@ const sFiles     = document.getElementById('s-files');
 const sBuild     = document.getElementById('s-build');
 const sUpdate    = document.getElementById('s-update');
 const sSearch    = document.getElementById('s-search');
+const sBackend   = document.getElementById('s-backend');
 
 // Stored timestamps for live refresh
 let tsFullBuild     = null;
@@ -149,15 +151,49 @@ function float32ToBase64(arr) {
 const modelReadyPromise = (async () => {
 	try {
 		const { pipeline, env } = await import('__TRANSFORMERS_URI__');
-		env.backends.onnx.wasm.wasmPaths = {
-			wasm: '__WASM_DIR_URI__ort-wasm-simd-threaded.asyncify.wasm',
-			mjs:  '__WASM_DIR_URI__ort-wasm-simd-threaded.asyncify.mjs',
-		};
-		const extractor = await pipeline(
-			'feature-extraction',
-			'jinaai/jina-embeddings-v2-base-code',
-			{ dtype: 'q8' },
-		);
+
+		// Detect WebGPU availability
+		let device = 'wasm';
+		if (typeof navigator !== 'undefined' && navigator.gpu) {
+			try {
+				const adapter = await navigator.gpu.requestAdapter();
+				if (adapter) { device = 'webgpu'; }
+			} catch { /* WebGPU not available */ }
+		}
+
+		if (device === 'wasm') {
+			env.backends.onnx.wasm.wasmPaths = {
+				wasm: '__WASM_DIR_URI__ort-wasm-simd-threaded.asyncify.wasm',
+				mjs:  '__WASM_DIR_URI__ort-wasm-simd-threaded.asyncify.mjs',
+			};
+		}
+
+		setStatus('Loading model (' + (device === 'webgpu' ? 'WebGPU' : 'WASM') + ')…');
+
+		let extractor;
+		try {
+			extractor = await pipeline(
+				'feature-extraction',
+				'jinaai/jina-embeddings-v2-base-code',
+				{ dtype: device === 'webgpu' ? 'fp32' : 'q8', device },
+			);
+		} catch (gpuErr) {
+			if (device !== 'webgpu') { throw gpuErr; }
+			// WebGPU failed — fall back to WASM
+			device = 'wasm';
+			env.backends.onnx.wasm.wasmPaths = {
+				wasm: '__WASM_DIR_URI__ort-wasm-simd-threaded.asyncify.wasm',
+				mjs:  '__WASM_DIR_URI__ort-wasm-simd-threaded.asyncify.mjs',
+			};
+			setStatus('Loading model (WASM fallback)…');
+			extractor = await pipeline(
+				'feature-extraction',
+				'jinaai/jina-embeddings-v2-base-code',
+				{ dtype: 'q8', device: 'wasm' },
+			);
+		}
+
+		sBackend.textContent = device === 'webgpu' ? 'WebGPU' : 'WASM';
 		vscode.postMessage({ type: 'modelReady' });
 		setStatus('Model ready', true);
 		return extractor;
