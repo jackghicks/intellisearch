@@ -2,7 +2,7 @@
   "name": "intellisearch",
   "displayName": "IntelliSearch",
   "description": "Semantic search for your codebase using local AI embeddings. Find code by concept, not just keywords.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "JackGHicks",
   "repository": {
     "type": "git",
@@ -98,7 +98,7 @@
     "vscode:prepublish": "npm run package-web",
     "compile-web": "webpack",
     "watch-web": "webpack --watch",
-    "package-web": "webpack --mode production --devtool hidden-source-map",
+    "package-web": "webpack --mode production --devtool hidden-source-map && vsce package",
     "lint": "eslint src",
     "run-in-browser": "vscode-test-web --browserType=chromium --extensionDevelopmentPath=."
   },

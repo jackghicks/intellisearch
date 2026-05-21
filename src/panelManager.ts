@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { chunkFile, isIndexable, RawChunk } from './chunker';
 import { saveIndex, loadIndex, indexExists } from './indexStore';
 import { Chunk, IndexData, MetaJson } from './types';
-import { MODEL_NAME, VECTOR_DIM, buildExcludeGlob } from './utils';
+import { MODEL_NAME, VECTOR_DIM, buildExcludeGlob, buildGitignoreFilter } from './utils';
 import { embedBatch, embedQuery, postWorkerStatus } from './embeddingWorker';
 import panelHtml from './webview/panel.html';
 
@@ -152,8 +152,11 @@ async function runBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
 }
 
 async function doBuildIndex(workspaceUri: vscode.Uri): Promise<void> {
-	const files = await vscode.workspace.findFiles('**/*', buildExcludeGlob());
-	const indexable = files.filter(isIndexable);
+	const [files, isGitIgnored] = await Promise.all([
+		vscode.workspace.findFiles('**/*', buildExcludeGlob()),
+		buildGitignoreFilter(workspaceUri),
+	]);
+	const indexable = files.filter(f => isIndexable(f) && !isGitIgnored(f));
 	console.log(`[intellisearch] findFiles done — total=${files.length}, indexable=${indexable.length}`);
 
 	currentView?.webview.postMessage({ type: 'chunkStart', total: indexable.length });
@@ -303,10 +306,12 @@ export async function runIncrementalUpdate(
 	// If a full build is running, it will produce a fresh index — skip.
 	if (isFullBuildInProgress || isIncrementalUpdating) { return; }
 
-	// Ignore non-indexable files and anything VS Code considers excluded
-	// (files.exclude + search.exclude — same sources as Find in Files).
-	const excludeGlob = buildExcludeGlob();
-	const changedIndexable = changed.filter(isIndexable);
+	// Ignore non-indexable files, workspace-excluded files, and git-ignored files.
+	const [excludeGlob, isGitIgnored] = await Promise.all([
+		Promise.resolve(buildExcludeGlob()),
+		buildGitignoreFilter(workspaceUri),
+	]);
+	const changedIndexable = changed.filter(u => isIndexable(u) && !isGitIgnored(u));
 	const toReindexRaw = await Promise.all(
 		changedIndexable.map(async u => {
 			const rel = u.path.slice(workspaceUri.path.length + 1);
